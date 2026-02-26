@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,22 @@ pub struct Cell {
     pub valid_from: SystemTime,
     pub valid_to: SystemTime,
     pub children: Vec<Uuid>, // Maintains sequence of child cells
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelationType {
+    Contains,
+    References,
+    DerivesFrom,
+    Custom(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FabricEdge {
+    pub parent_id: Uuid,
+    pub child_id: Uuid,
+    pub relation_type: RelationType,
+    pub ordinal: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

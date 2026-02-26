@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::models::{Cell, CellType, ContentFormat};
-use crate::storage::SqliteStorage;
 use crate::error::Result;
+use crate::models::{Cell, CellType, ContentFormat, FabricEdge, RelationType};
+use crate::storage::SqliteStorage;
 use std::time::SystemTime;
 use uuid::Uuid;
+
 pub struct Engine {
     storage: SqliteStorage,
 }
@@ -36,7 +37,7 @@ impl Engine {
         let now = SystemTime::now();
         // Set valid_to to a very far future date (approx. 100 years from now)
         let far_future = now + std::time::Duration::from_secs(100 * 365 * 24 * 3600);
-        
+
         let cell = Cell {
             id: Uuid::now_v7(),
             cell_type,
@@ -54,21 +55,18 @@ impl Engine {
     pub fn update_cell_content(&self, cell_id: Uuid, new_content: Vec<u8>) -> Result<Cell> {
         let mut cell = self.storage.get_cell(cell_id)?;
         let now = SystemTime::now();
-        
+
         // 1. Update the old version's valid_to to 'now'
         let mut old_version = cell.clone();
         old_version.valid_to = now;
         self.storage.insert_cell_with_replace(&old_version)?;
-        
-        // Ensure new version's valid_to is different from old one's valid_to if 'now' happened to be the same.
-        // But since we are creating a new version with a far-future valid_to, it should be fine.
-        
+
         // 2. Create the new version with same ID starting from 'now'
         cell.content = new_content;
         cell.valid_from = now;
         let far_future = now + std::time::Duration::from_secs(100 * 365 * 24 * 3600);
         cell.valid_to = far_future;
-        
+
         self.storage.insert_cell(&cell)?;
         Ok(cell)
     }
@@ -76,15 +74,49 @@ impl Engine {
     pub fn add_child(&self, parent_id: Uuid, child_id: Uuid) -> Result<()> {
         let mut parent = self.storage.get_cell(parent_id)?;
         parent.children.push(child_id);
-        // We need an update method in storage, or just re-insert if we handle conflicts
-        // For now let's assume we need an update method.
         self.update_cell(&parent)?;
+        self.add_relation(
+            parent_id,
+            child_id,
+            RelationType::Contains,
+            Some(parent.children.len() as i64 - 1),
+        )?;
         Ok(())
     }
 
+    pub fn add_relation(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+        relation_type: RelationType,
+        ordinal: Option<i64>,
+    ) -> Result<()> {
+        let resolved_ordinal = match ordinal {
+            Some(value) => value,
+            None => self
+                .storage
+                .next_relation_ordinal(parent_id, &relation_type)?,
+        };
+
+        let edge = FabricEdge {
+            parent_id,
+            child_id,
+            relation_type,
+            ordinal: resolved_ordinal,
+        };
+        self.storage.insert_edge(&edge)
+    }
+
+    pub fn get_children_by_relation(
+        &self,
+        parent_id: Uuid,
+        relation_type: RelationType,
+    ) -> Result<Vec<Uuid>> {
+        self.storage
+            .get_children_by_relation(parent_id, &relation_type)
+    }
+
     pub fn update_cell(&self, cell: &Cell) -> Result<()> {
-        // We use insert_cell_with_replace because (id, valid_to) is the PK.
-        // If valid_to changed, it will be a new row. If not, it will replace.
         self.storage.insert_cell_with_replace(cell)?;
         Ok(())
     }
