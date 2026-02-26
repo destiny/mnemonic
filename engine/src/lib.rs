@@ -13,10 +13,10 @@
 // limitations under the License.
 
 pub mod engine;
-pub mod storage;
-pub mod models;
 pub mod error;
+pub mod models;
+pub mod storage;
 
 pub use engine::Engine;
-pub use models::{Cell, CellType, ContentFormat};
 pub use error::{EngineError, Result};
+pub use models::{Cell, CellType, ContentFormat, FabricEdge, RelationType};
