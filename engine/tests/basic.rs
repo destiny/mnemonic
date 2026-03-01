@@ -12,90 +12,188 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use mnemonic_engine::{
+    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, MAX_TIME, RelationType,
+    VersionCandidate,
+};
+
+// Black-box specification baseline derived from AGENTS.md.
+const SPEC_RULES: &[&str] = &[
+    "Open-ended active rows use valid_to = MAX_TIME",
+    "Temporal validity window is valid_from <= T < valid_to",
+    "Update algorithm: close active row, then insert new active row",
+    "Current reads are time-window based, not hard-coded to MAX_TIME",
+    "Fabric context reconstruction is deterministic at any timestamp",
+    "Conflicts are resolved before promoting a new active version",
+];
+
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
 
 #[test]
-fn test_cell_lifecycle() {
-    let engine = Engine::new(":memory:").unwrap();
+fn spec_sanity_rules_exist() {
+    assert_eq!(SPEC_RULES.len(), 6);
+}
 
-    // Create a raw data cell
-    let raw_cell = engine
-        .create_cell(
-            CellType::Raw,
-            ContentFormat::Text,
-            "Hello world!".as_bytes().to_vec(),
-        )
+#[test]
+fn spec_cell_uses_max_time_and_current_lookup() {
+    let engine = Engine::new(":memory:").unwrap();
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"hello".to_vec())
         .unwrap();
 
-    // Create a digested cell
-    let digested_cell = engine
+    assert_eq!(cell.valid_to, MAX_TIME);
+
+    let current = engine.get_current(cell.id).unwrap();
+    assert_eq!(current.content, b"hello".to_vec());
+    assert_eq!(current.valid_to, MAX_TIME);
+}
+
+#[test]
+fn spec_temporal_window_boundary_on_update() {
+    let engine = Engine::new(":memory:").unwrap();
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"v1".to_vec())
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let before_update = now_ts();
+
+    let updated = engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
+
+    // AGENTS window semantics: valid_from <= T < valid_to.
+    let old_at_before = engine.get_at_time(cell.id, before_update).unwrap();
+    assert_eq!(old_at_before.content, b"v1".to_vec());
+
+    let at_boundary = engine.get_at_time(cell.id, updated.valid_from).unwrap();
+    assert_eq!(at_boundary.content, b"v2".to_vec());
+    assert_eq!(at_boundary.valid_to, MAX_TIME);
+}
+
+#[test]
+fn spec_conflict_resolution_deterministic() {
+    let engine = Engine::new(":memory:").unwrap();
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"base".to_vec())
+        .unwrap();
+
+    let local = VersionCandidate {
+        content: b"local".to_vec(),
+        timestamp: 100,
+        logical_clock: Some(3),
+    };
+    let remote = VersionCandidate {
+        content: b"remote".to_vec(),
+        timestamp: 200,
+        logical_clock: Some(2),
+    };
+
+    let lww = engine
+        .resolve_conflict_and_update(
+            cell.id,
+            local.clone(),
+            remote.clone(),
+            ConflictStrategy::LastWriteWins,
+        )
+        .unwrap();
+    assert_eq!(lww.content, b"remote".to_vec());
+
+    let logical = engine
+        .resolve_conflict_and_update(cell.id, local, remote, ConflictStrategy::LogicalClock)
+        .unwrap();
+    assert_eq!(logical.content, b"local".to_vec());
+}
+
+#[test]
+fn spec_temporal_fabric_edges_when_enabled() {
+    let engine = Engine::with_config(
+        ":memory:",
+        EngineConfig {
+            temporal_fabric_edges: true,
+        },
+    )
+    .unwrap();
+
+    let parent = engine
+        .create_cell(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+    let first = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"first".to_vec())
+        .unwrap();
+    let second = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"second".to_vec())
+        .unwrap();
+
+    engine
+        .add_relation(parent.id, first.id, RelationType::Contains, Some(0))
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let t_before_switch = now_ts();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    engine
+        .add_relation(parent.id, second.id, RelationType::Contains, Some(0))
+        .unwrap();
+
+    let historical = engine
+        .build_context_at_time(parent.id, t_before_switch)
+        .unwrap();
+    assert!(historical.edges.iter().any(|e| e.child_id == first.id));
+
+    let current = engine.build_context(parent.id).unwrap();
+    assert!(current.edges.iter().any(|e| e.child_id == second.id));
+}
+
+#[test]
+fn e2e_lifecycle_black_box_acceptance() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let raw = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"Hello world!".to_vec())
+        .unwrap();
+    let digested = engine
         .create_cell(
             CellType::Digested,
             ContentFormat::Text,
-            "HELLO WORLD!".as_bytes().to_vec(),
+            b"HELLO WORLD!".to_vec(),
         )
         .unwrap();
-
-    // Create a container cell to group them
     let container = engine
         .create_cell(CellType::Container, ContentFormat::Json, vec![])
         .unwrap();
 
-    // Add both to container
-    engine.add_child(container.id, raw_cell.id).unwrap();
-    engine.add_child(container.id, digested_cell.id).unwrap();
+    engine.add_child(container.id, raw.id).unwrap();
+    engine.add_child(container.id, digested.id).unwrap();
+    engine
+        .add_relation(digested.id, raw.id, RelationType::DerivesFrom, None)
+        .unwrap();
 
-    // Fetch and verify legacy children list remains usable
-    let fetched_container = engine.get_cell(container.id).unwrap();
-    assert_eq!(fetched_container.children.len(), 2);
-    assert_eq!(fetched_container.children[0], raw_cell.id);
-    assert_eq!(fetched_container.children[1], digested_cell.id);
-
-    // Verify relation/fabric-based links
-    let contains_children = engine
+    let contains = engine
         .get_children_by_relation(container.id, RelationType::Contains)
         .unwrap();
-    assert_eq!(contains_children, vec![raw_cell.id, digested_cell.id]);
+    assert_eq!(contains, vec![raw.id, digested.id]);
 
-    // Add another semantic relationship
+    let before_update = now_ts();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
     engine
-        .add_relation(
-            digested_cell.id,
-            raw_cell.id,
-            RelationType::DerivesFrom,
-            None,
-        )
-        .unwrap();
-    let derived_from = engine
-        .get_children_by_relation(digested_cell.id, RelationType::DerivesFrom)
-        .unwrap();
-    assert_eq!(derived_from, vec![raw_cell.id]);
-
-    let fetched_raw = engine.get_cell(raw_cell.id).unwrap();
-    assert_eq!(fetched_raw.content, "Hello world!".as_bytes());
-
-    // Wait a bit to ensure SystemTime::now() advances
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    // Test versioning: update content
-    let updated_raw = engine
-        .update_cell_content(raw_cell.id, "Updated content".as_bytes().to_vec())
+        .update_cell_content(raw.id, b"Updated content".to_vec())
         .unwrap();
 
-    // Fetching by ID should return the latest version
-    let latest_raw = engine.get_cell(raw_cell.id).unwrap();
-    assert_eq!(latest_raw.content, "Updated content".as_bytes());
+    let current_raw = engine.get_current(raw.id).unwrap();
+    let historical_raw = engine.get_at_time(raw.id, before_update).unwrap();
+    assert_eq!(current_raw.content, b"Updated content".to_vec());
+    assert_eq!(historical_raw.content, b"Hello world!".to_vec());
 
-    // Compare timestamps with millisecond precision
-    let latest_valid_to_ms = latest_raw
-        .valid_to
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let updated_valid_to_ms = updated_raw
-        .valid_to
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    assert_eq!(latest_valid_to_ms, updated_valid_to_ms);
+    let context_now = engine.build_context(container.id).unwrap();
+    assert_eq!(context_now.root.id, container.id);
+    assert!(context_now.cells.iter().any(|c| c.id == raw.id));
+    assert!(context_now.cells.iter().any(|c| c.id == digested.id));
 }

@@ -17,6 +17,10 @@ pub mod error;
 pub mod models;
 pub mod storage;
 
-pub use engine::Engine;
+pub use engine::{Engine, EngineConfig};
 pub use error::{EngineError, Result};
-pub use models::{Cell, CellType, ContentFormat, FabricEdge, RelationType};
+pub use models::{
+    Cell, CellType, ConflictStrategy, ContentFormat, FabricContext, FabricEdge, RelationType,
+    VersionCandidate,
+};
+pub use storage::MAX_TIME;
