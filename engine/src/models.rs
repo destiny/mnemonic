@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,9 +20,9 @@ pub struct Cell {
     pub id: Uuid,
     pub cell_type: CellType,
     pub format: ContentFormat,
-    pub content: Vec<u8>, // Use Vec<u8> to store both text and binary data
-    pub valid_from: SystemTime,
-    pub valid_to: SystemTime,
+    pub content: Vec<u8>,    // Use Vec<u8> to store both text and binary data
+    pub valid_from: i64,     // epoch timestamp (integer)
+    pub valid_to: i64,       // epoch timestamp (integer)
     pub children: Vec<Uuid>, // Maintains sequence of child cells
 }
 
@@ -41,6 +40,26 @@ pub struct FabricEdge {
     pub child_id: Uuid,
     pub relation_type: RelationType,
     pub ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FabricContext {
+    pub root: Cell,
+    pub edges: Vec<FabricEdge>,
+    pub cells: Vec<Cell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConflictStrategy {
+    LastWriteWins,
+    LogicalClock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionCandidate {
+    pub content: Vec<u8>,
+    pub timestamp: i64,
+    pub logical_clock: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

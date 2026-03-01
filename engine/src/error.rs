@@ -22,6 +22,8 @@ pub enum EngineError {
     Serialization(#[from] serde_json::Error),
     #[error("Cell not found")]
     NotFound,
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
