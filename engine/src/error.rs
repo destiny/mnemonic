@@ -18,8 +18,16 @@ use thiserror::Error;
 pub enum EngineError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] postgres::Error),
+    #[error("MySQL error: {0}")]
+    MySql(#[from] mysql::Error),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
+    #[error("Internal error: {0}")]
+    Internal(String),
     #[error("Cell not found")]
     NotFound,
     #[error("Conflict: {0}")]

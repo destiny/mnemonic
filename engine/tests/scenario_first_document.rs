@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use mnemonic_engine::{CellType, ContentFormat, Engine, MAX_TIME, RelationType};
+use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
@@ -54,6 +55,13 @@ struct CasePaths {
 
 fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
+}
+
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
 }
 
 fn scenario_output_dir() -> PathBuf {
@@ -860,16 +868,17 @@ fn store_scenario_into_engine(
 }
 
 fn get_active_content(conn: &Connection, id: Uuid) -> String {
+    let now = now_ts();
     let sql = "
         SELECT content FROM data_cell
-        WHERE id = ?1 AND valid_to = ?2
+        WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2
         UNION ALL
         SELECT content FROM meta_cell
-        WHERE id = ?1 AND valid_to = ?2
+        WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2
         LIMIT 1
     ";
     let bytes: Vec<u8> = conn
-        .query_row(sql, params![id.to_string(), MAX_TIME], |row| row.get(0))
+        .query_row(sql, params![id.to_string(), now], |row| row.get(0))
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -879,22 +888,23 @@ fn query_children_by_relation(
     root_id: Uuid,
     relation: RelationType,
 ) -> Vec<Uuid> {
+    let now = now_ts();
     let mut stmt = conn
         .prepare(
             "SELECT child_id
              FROM fabric_edge
-             WHERE parent_id = ?1 AND relation_type = ?2 AND valid_to = ?3
+             WHERE parent_id = ?1
+               AND relation_type = ?2
+               AND valid_from <= ?3
+               AND valid_to > ?3
              ORDER BY ordinal ASC",
         )
         .unwrap();
     let relation_json = relation_type_json(relation);
-    stmt.query_map(
-        params![root_id.to_string(), relation_json, MAX_TIME],
-        |row| {
-            let child_id: String = row.get(0)?;
-            Ok(Uuid::parse_str(&child_id).unwrap())
-        },
-    )
+    stmt.query_map(params![root_id.to_string(), relation_json, now], |row| {
+        let child_id: String = row.get(0)?;
+        Ok(Uuid::parse_str(&child_id).unwrap())
+    })
     .unwrap()
     .map(|row| row.unwrap())
     .collect::<Vec<_>>()
@@ -964,24 +974,25 @@ fn write_db_snapshot(
     generated: &GeneratedDocument,
 ) {
     let conn = Connection::open(db_path).unwrap();
+    let now = now_ts();
     let active_data_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM data_cell WHERE valid_to = ?1",
-            params![MAX_TIME],
+            "SELECT COUNT(*) FROM data_cell WHERE valid_from <= ?1 AND valid_to > ?1",
+            params![now],
             |row| row.get(0),
         )
         .unwrap();
     let active_meta_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM meta_cell WHERE valid_to = ?1",
-            params![MAX_TIME],
+            "SELECT COUNT(*) FROM meta_cell WHERE valid_from <= ?1 AND valid_to > ?1",
+            params![now],
             |row| row.get(0),
         )
         .unwrap();
     let active_edge_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM fabric_edge WHERE valid_to = ?1",
-            params![MAX_TIME],
+            "SELECT COUNT(*) FROM fabric_edge WHERE valid_from <= ?1 AND valid_to > ?1",
+            params![now],
             |row| row.get(0),
         )
         .unwrap();

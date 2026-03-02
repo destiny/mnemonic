@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::{EngineError, Result};
@@ -23,7 +22,7 @@ use crate::models::{
     Cell, CellType, ConflictStrategy, ContentFormat, FabricContext, FabricEdge, RelationType,
     VersionCandidate,
 };
-use crate::storage::{MAX_TIME, SqliteStorage};
+use crate::storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
@@ -39,7 +38,7 @@ impl Default for EngineConfig {
 }
 
 pub struct Engine {
-    storage: SqliteStorage,
+    storage: Box<dyn Storage>,
 }
 
 impl Engine {
@@ -49,35 +48,47 @@ impl Engine {
 
     pub fn with_config(db_path: &str, config: EngineConfig) -> Result<Self> {
         let storage = SqliteStorage::new(db_path, config.temporal_fabric_edges)?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage: Box::new(storage),
+        })
     }
 
-    fn now_ts() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_micros() as i64
+    pub fn from_storage(storage: Box<dyn Storage>) -> Self {
+        Self { storage }
+    }
+
+    pub fn with_postgres_config(connection_str: &str, config: EngineConfig) -> Result<Self> {
+        let storage = PostgresStorage::new(connection_str, config.temporal_fabric_edges)?;
+        Ok(Self {
+            storage: Box::new(storage),
+        })
+    }
+
+    pub fn with_mysql_config(connection_str: &str, config: EngineConfig) -> Result<Self> {
+        let storage = MySqlStorage::new(connection_str, config.temporal_fabric_edges)?;
+        Ok(Self {
+            storage: Box::new(storage),
+        })
+    }
+
+    pub fn with_mariadb_config(connection_str: &str, config: EngineConfig) -> Result<Self> {
+        let storage = MariaDbStorage::new(connection_str, config.temporal_fabric_edges)?;
+        Ok(Self {
+            storage: Box::new(storage),
+        })
+    }
+
+    fn now_ts(&self) -> Result<i64> {
+        self.storage.current_timestamp()
     }
 
     fn reserve_now_for_cell(&self, cell_id: Uuid) -> Result<i64> {
-        let candidate = Self::now_ts();
+        let candidate = self.now_ts()?;
         let now = self.storage.reserve_update_timestamp(cell_id, candidate)?;
         if now > candidate {
             std::thread::sleep(Duration::from_micros((now - candidate) as u64));
         }
         Ok(now)
-    }
-
-    fn append_change_log(
-        &self,
-        now_ts: i64,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        detail: serde_json::Value,
-    ) -> Result<()> {
-        self.storage
-            .insert_change_log(now_ts, entity_type, entity_id, action, &detail.to_string())
     }
 
     pub fn create_cell(
@@ -86,7 +97,7 @@ impl Engine {
         format: ContentFormat,
         content: Vec<u8>,
     ) -> Result<Cell> {
-        let now = Self::now_ts();
+        let now = self.now_ts()?;
 
         let cell = Cell {
             id: Uuid::now_v7(),
@@ -94,18 +105,11 @@ impl Engine {
             format,
             content,
             valid_from: now,
-            valid_to: MAX_TIME,
+            valid_to: self.storage.open_ended_valid_to(),
             children: Vec::new(),
         };
 
         self.storage.insert_cell(&cell)?;
-        self.append_change_log(
-            now,
-            "cell",
-            &cell.id.to_string(),
-            "create_cell",
-            json!({ "cell_type": cell.cell_type, "format": cell.format }),
-        )?;
 
         Ok(cell)
     }
@@ -117,16 +121,8 @@ impl Engine {
         self.storage.close_active_version(cell_id, now)?;
         cell.content = new_content;
         cell.valid_from = now;
-        cell.valid_to = MAX_TIME;
+        cell.valid_to = self.storage.open_ended_valid_to();
         self.storage.insert_cell(&cell)?;
-
-        self.append_change_log(
-            now,
-            "cell",
-            &cell.id.to_string(),
-            "update_cell_content",
-            json!({ "content_len": cell.content.len() }),
-        )?;
 
         Ok(cell)
     }
@@ -174,21 +170,8 @@ impl Engine {
 
         cell.content = winner.content;
         cell.valid_from = now;
-        cell.valid_to = MAX_TIME;
+        cell.valid_to = self.storage.open_ended_valid_to();
         self.storage.insert_cell(&cell)?;
-
-        self.append_change_log(
-            now,
-            "cell",
-            &cell.id.to_string(),
-            "resolve_conflict_and_update",
-            json!({
-                "strategy": strategy,
-                "winner_timestamp": winner.timestamp,
-                "winner_logical_clock": winner.logical_clock,
-                "winner_content_len": cell.content.len()
-            }),
-        )?;
 
         Ok(cell)
     }
@@ -229,20 +212,8 @@ impl Engine {
             ordinal: resolved_ordinal,
         };
 
-        let now = Self::now_ts();
+        let now = self.now_ts()?;
         self.storage.insert_edge(&edge, now)?;
-        self.append_change_log(
-            now,
-            "edge",
-            &format!(
-                "{}:{}:{}",
-                edge.parent_id,
-                serde_json::to_string(&edge.relation_type)?,
-                edge.ordinal
-            ),
-            "add_relation",
-            json!({ "child_id": edge.child_id }),
-        )?;
 
         Ok(())
     }
@@ -253,7 +224,7 @@ impl Engine {
         relation_type: RelationType,
     ) -> Result<Vec<Uuid>> {
         self.storage
-            .get_children_by_relation(parent_id, &relation_type, Self::now_ts())
+            .get_children_by_relation(parent_id, &relation_type, self.now_ts()?)
     }
 
     pub fn update_cell(&self, cell: &Cell) -> Result<()> {
@@ -266,24 +237,17 @@ impl Engine {
             format: cell.format.clone(),
             content: cell.content.clone(),
             valid_from: now,
-            valid_to: MAX_TIME,
+            valid_to: self.storage.open_ended_valid_to(),
             children: cell.children.clone(),
         };
 
         self.storage.insert_cell(&next)?;
-        self.append_change_log(
-            now,
-            "cell",
-            &next.id.to_string(),
-            "update_cell",
-            json!({ "children_len": next.children.len() }),
-        )?;
 
         Ok(())
     }
 
     pub fn get_current(&self, id: Uuid) -> Result<Cell> {
-        self.storage.get_cell_at(id, Self::now_ts())
+        self.storage.get_cell_at(id, self.now_ts()?)
     }
 
     pub fn get_at_time(&self, id: Uuid, timestamp: i64) -> Result<Cell> {
@@ -291,7 +255,7 @@ impl Engine {
     }
 
     pub fn build_context(&self, fabric_id: Uuid) -> Result<FabricContext> {
-        self.build_context_at_time(fabric_id, Self::now_ts())
+        self.build_context_at_time(fabric_id, self.now_ts()?)
     }
 
     pub fn build_context_at_time(&self, fabric_id: Uuid, timestamp: i64) -> Result<FabricContext> {

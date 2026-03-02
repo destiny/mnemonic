@@ -15,10 +15,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use super::Storage;
 use crate::error::{EngineError, Result};
 use crate::models::{Cell, CellType, FabricEdge, RelationType};
-
-pub const MAX_TIME: i64 = i64::MAX;
 
 #[derive(Debug, Clone, Copy)]
 enum CellTable {
@@ -39,6 +38,8 @@ pub struct SqliteStorage {
     conn: Connection,
     temporal_fabric_edges: bool,
 }
+
+const SQLITE_OPEN_ENDED_VALID_TO: i64 = i64::MAX;
 
 impl SqliteStorage {
     pub fn new(path: &str, temporal_fabric_edges: bool) -> Result<Self> {
@@ -104,18 +105,6 @@ impl SqliteStorage {
         )?;
 
         self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS change_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_time INTEGER NOT NULL,
-                entity_type TEXT NOT NULL,
-                entity_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                detail_json TEXT NOT NULL
-            )",
-            params![],
-        )?;
-
-        self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS data_cell_one_active_per_id
              ON data_cell(id)
              WHERE valid_to = 9223372036854775807",
@@ -136,22 +125,6 @@ impl SqliteStorage {
             params![],
         )?;
 
-        Ok(())
-    }
-
-    pub fn insert_change_log(
-        &self,
-        event_time: i64,
-        entity_type: &str,
-        entity_id: &str,
-        action: &str,
-        detail_json: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO change_log (event_time, entity_type, entity_id, action, detail_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![event_time, entity_type, entity_id, action, detail_json],
-        )?;
         Ok(())
     }
 
@@ -262,7 +235,7 @@ impl SqliteStorage {
                 FROM {} WHERE id = ?1
             )",
             table.as_str(),
-            MAX_TIME,
+            SQLITE_OPEN_ENDED_VALID_TO,
             table.as_str()
         );
 
@@ -376,7 +349,7 @@ impl SqliteStorage {
                     serde_json::to_string(&edge.relation_type)?,
                     edge.ordinal,
                     now_ts,
-                    MAX_TIME,
+                    SQLITE_OPEN_ENDED_VALID_TO,
                 ],
             )?;
         } else {
@@ -400,7 +373,7 @@ impl SqliteStorage {
                     edge.child_id.to_string(),
                     serde_json::to_string(&edge.relation_type)?,
                     edge.ordinal,
-                    MAX_TIME,
+                    SQLITE_OPEN_ENDED_VALID_TO,
                 ],
             )?;
         }
@@ -525,5 +498,57 @@ impl SqliteStorage {
         }
 
         Ok(result)
+    }
+}
+
+impl Storage for SqliteStorage {
+    fn current_timestamp(&self) -> Result<i64> {
+        let now: i64 = self.conn.query_row(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(now)
+    }
+
+    fn open_ended_valid_to(&self) -> i64 {
+        SQLITE_OPEN_ENDED_VALID_TO
+    }
+
+    fn insert_cell(&self, cell: &Cell) -> Result<()> {
+        SqliteStorage::insert_cell(self, cell)
+    }
+
+    fn reserve_update_timestamp(&self, id: Uuid, candidate_ts: i64) -> Result<i64> {
+        SqliteStorage::reserve_update_timestamp(self, id, candidate_ts)
+    }
+
+    fn get_cell_at(&self, id: Uuid, ts: i64) -> Result<Cell> {
+        SqliteStorage::get_cell_at(self, id, ts)
+    }
+
+    fn close_active_version(&self, id: Uuid, now_ts: i64) -> Result<()> {
+        SqliteStorage::close_active_version(self, id, now_ts)
+    }
+
+    fn insert_edge(&self, edge: &FabricEdge, now_ts: i64) -> Result<()> {
+        SqliteStorage::insert_edge(self, edge, now_ts)
+    }
+
+    fn next_relation_ordinal(&self, parent_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+        SqliteStorage::next_relation_ordinal(self, parent_id, relation_type)
+    }
+
+    fn get_children_by_relation(
+        &self,
+        parent_id: Uuid,
+        relation_type: &RelationType,
+        ts: i64,
+    ) -> Result<Vec<Uuid>> {
+        SqliteStorage::get_children_by_relation(self, parent_id, relation_type, ts)
+    }
+
+    fn get_edges_for_parent(&self, parent_id: Uuid, ts: i64) -> Result<Vec<FabricEdge>> {
+        SqliteStorage::get_edges_for_parent(self, parent_id, ts)
     }
 }

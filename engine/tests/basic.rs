@@ -15,16 +15,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mnemonic_engine::{
-    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, MAX_TIME, RelationType,
-    VersionCandidate,
+    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, RelationType, VersionCandidate,
 };
 
 // Black-box specification baseline derived from AGENTS.md.
 const SPEC_RULES: &[&str] = &[
-    "Open-ended active rows use valid_to = MAX_TIME",
+    "Open-ended active rows are selected via time-window semantics",
     "Temporal validity window is valid_from <= T < valid_to",
     "Update algorithm: close active row, then insert new active row",
-    "Current reads are time-window based, not hard-coded to MAX_TIME",
+    "Current reads are time-window based, not hard-coded to a sentinel",
     "Fabric context reconstruction is deterministic at any timestamp",
     "Conflicts are resolved before promoting a new active version",
 ];
@@ -48,11 +47,14 @@ fn spec_cell_uses_max_time_and_current_lookup() {
         .create_cell(CellType::Raw, ContentFormat::Text, b"hello".to_vec())
         .unwrap();
 
-    assert_eq!(cell.valid_to, MAX_TIME);
+    let now = now_ts();
+    assert!(cell.valid_from <= now);
+    assert!(cell.valid_to > now);
 
     let current = engine.get_current(cell.id).unwrap();
     assert_eq!(current.content, b"hello".to_vec());
-    assert_eq!(current.valid_to, MAX_TIME);
+    assert!(current.valid_from <= now_ts());
+    assert!(current.valid_to > now_ts());
 }
 
 #[test]
@@ -63,7 +65,7 @@ fn spec_temporal_window_boundary_on_update() {
         .unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let before_update = now_ts();
+    let before_update = cell.valid_from;
 
     let updated = engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
 
@@ -73,7 +75,7 @@ fn spec_temporal_window_boundary_on_update() {
 
     let at_boundary = engine.get_at_time(cell.id, updated.valid_from).unwrap();
     assert_eq!(at_boundary.content, b"v2".to_vec());
-    assert_eq!(at_boundary.valid_to, MAX_TIME);
+    assert!(at_boundary.valid_to > at_boundary.valid_from);
 }
 
 #[test]
