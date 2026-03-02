@@ -1,0 +1,21 @@
+Scenario Snapshot
+case_id=case_03
+document_type=academic_paper
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-e001-7740-9e4d-b3f07e51ec0d
+purpose_id=019caed6-e003-7af0-8b35-5e5bc54cb3a7
+section_count=6
+reference_count=60
+tag_count=7
+target_words=10000
+actual_words=10000
+active_data_rows=41 active_meta_rows=153 active_edge_rows=191
+
+Extracted repeated terms:
+- error bounds: 42
+- ablation study: 18
+- adaptive planning: 18
+- baseline model: 18
+- reproducibility: 18
+- resource constraints: 18
+- confidence interval: 16

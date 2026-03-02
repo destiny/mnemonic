@@ -1,0 +1,22 @@
+Scenario Snapshot
+case_id=case_01
+document_type=technical_document
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-df04-7181-8031-c8c769e8c3f5
+purpose_id=019caed6-df06-76f3-927e-7f73aeafe8c3
+section_count=5
+reference_count=40
+tag_count=8
+target_words=10000
+actual_words=10000
+active_data_rows=14 active_meta_rows=41 active_edge_rows=54
+
+Extracted repeated terms:
+- stale read: 40
+- retry queue: 39
+- event bus: 25
+- incident commander: 20
+- lease token: 20
+- runbook: 19
+- cache invalidation: 10
+- write-through cache: 10

@@ -1,0 +1,20 @@
+Scenario Snapshot - First Case (Technical Document)
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed2-06e3-7ed2-905a-8d2f2d02fbe9
+purpose_id=019caed2-06e4-7d83-a930-fa7c05bb5763
+section_count=5
+reference_count=40
+tag_count=8
+target_words=10000
+actual_words=10000
+active_data_rows=14 active_meta_rows=41 active_edge_rows=54
+
+Extracted repeated terms:
+- incident commander: 100
+- retry queue: 100
+- runbook: 89
+- stale read: 80
+- cache invalidation: 77
+- lease token: 60
+- event bus: 58
+- write-through cache: 37

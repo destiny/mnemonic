@@ -1,0 +1,20 @@
+Scenario Snapshot
+case_id=case_06
+document_type=drama_script
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-e224-7a50-a926-c827a554d580
+purpose_id=019caed6-e226-76f2-ae31-7f93e42108eb
+section_count=6
+reference_count=20
+tag_count=6
+target_words=25000
+actual_words=25000
+active_data_rows=82 active_meta_rows=276 active_edge_rows=352
+
+Extracted repeated terms:
+- Elena: 144
+- Old Chapel: 90
+- Marcus: 72
+- Winter Gala: 72
+- family oath: 72
+- red ledger: 36

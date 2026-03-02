@@ -1,0 +1,21 @@
+Scenario Snapshot
+case_id=case_08
+document_type=document_with_external_references
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-e3db-7782-99a3-333150f1eed6
+purpose_id=019caed6-e3dd-7851-8541-333bba45cb52
+section_count=6
+reference_count=300
+tag_count=7
+target_words=12000
+actual_words=12000
+active_data_rows=110 active_meta_rows=698 active_edge_rows=800
+
+Extracted repeated terms:
+- audit trail: 78
+- evidence link: 72
+- verification note: 72
+- external reference: 66
+- control mapping: 48
+- policy exception: 30
+- remediation action: 24

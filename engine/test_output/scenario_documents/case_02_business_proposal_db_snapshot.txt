@@ -1,0 +1,21 @@
+Scenario Snapshot
+case_id=case_02
+document_type=business_proposal
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-df83-7bc1-b9e6-5bc1ccabedca
+purpose_id=019caed6-df84-7261-b629-07d7beb58af0
+section_count=5
+reference_count=50
+tag_count=7
+target_words=10000
+actual_words=10000
+active_data_rows=27 active_meta_rows=92 active_edge_rows=117
+
+Extracted repeated terms:
+- payback period: 50
+- market entry: 25
+- go-to-market: 20
+- operating margin: 20
+- forecast variance: 15
+- risk register: 15
+- unit economics: 15

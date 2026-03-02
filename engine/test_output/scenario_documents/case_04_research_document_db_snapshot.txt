@@ -1,0 +1,21 @@
+Scenario Snapshot
+case_id=case_04
+document_type=research_document
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-e0a8-77a1-99c7-fcde6ededb37
+purpose_id=019caed6-e0a9-7b80-af84-dbcc9c01b237
+section_count=6
+reference_count=80
+tag_count=7
+target_words=10000
+actual_words=10000
+active_data_rows=55 active_meta_rows=234 active_edge_rows=285
+
+Extracted repeated terms:
+- grounding check: 42
+- hallucination risk: 42
+- traceability: 30
+- evaluation harness: 18
+- failure mode: 18
+- recovery strategy: 18
+- tool call: 18

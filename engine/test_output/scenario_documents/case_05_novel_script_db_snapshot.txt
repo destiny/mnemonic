@@ -1,0 +1,21 @@
+Scenario Snapshot
+case_id=case_05
+document_type=novel_script
+shared_sqlite_file=general_daily_cases.sqlite
+root_id=019caed6-e19f-77c0-af9b-32edf9a095e1
+purpose_id=019caed6-e1a1-7e72-a046-b59c5f2b7cc0
+section_count=6
+reference_count=20
+tag_count=7
+target_words=100000
+actual_words=100000
+active_data_rows=69 active_meta_rows=255 active_edge_rows=319
+
+Extracted repeated terms:
+- Captain Mira: 606
+- Orion Station: 399
+- Council Accord: 183
+- Echo Gate: 183
+- Helios Archive: 180
+- Navigator Rune: 180
+- Ashfall Event: 177
