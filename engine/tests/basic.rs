@@ -199,3 +199,50 @@ fn e2e_lifecycle_black_box_acceptance() {
     assert!(context_now.cells.iter().any(|c| c.id == raw.id));
     assert!(context_now.cells.iter().any(|c| c.id == digested.id));
 }
+
+#[test]
+fn context_defers_writes_until_save() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let root = engine
+        .create_cell(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+    let child = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"original".to_vec())
+        .unwrap();
+    engine.add_child(root.id, child.id).unwrap();
+
+    let mut context = engine.open_document_context(root.id, None).unwrap();
+    context
+        .update_cell_content(child.id, b"draft".to_vec())
+        .unwrap();
+
+    let db_before_save = engine.get_current(child.id).unwrap();
+    assert_eq!(db_before_save.content, b"original".to_vec());
+
+    context.save().unwrap();
+
+    let db_after_save = engine.get_current(child.id).unwrap();
+    assert_eq!(db_after_save.content, b"draft".to_vec());
+}
+
+#[test]
+fn optional_timestamp_uses_current_when_missing_and_history_when_present() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"v1".to_vec())
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let ts_before_update = now_ts();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
+
+    let current_via_optional = engine.get_cell_at(cell.id, None).unwrap();
+    let historical_via_optional = engine.get_cell_at(cell.id, Some(ts_before_update)).unwrap();
+
+    assert_eq!(current_via_optional.content, b"v2".to_vec());
+    assert_eq!(historical_via_optional.content, b"v1".to_vec());
+}

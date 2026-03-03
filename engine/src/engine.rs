@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use uuid::Uuid;
@@ -39,6 +40,50 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     storage: Box<dyn Storage>,
+    context_cache: RefCell<HashMap<Uuid, FabricContext>>,
+}
+
+pub struct DocumentContext<'a> {
+    engine: &'a Engine,
+    root_id: Uuid,
+    cells: HashMap<Uuid, Cell>,
+    dirty_cells: HashSet<Uuid>,
+}
+
+impl<'a> DocumentContext<'a> {
+    pub fn root_id(&self) -> Uuid {
+        self.root_id
+    }
+
+    pub fn get_cell(&self, id: Uuid) -> Option<&Cell> {
+        self.cells.get(&id)
+    }
+
+    pub fn update_cell_content(&mut self, cell_id: Uuid, new_content: Vec<u8>) -> Result<()> {
+        let Some(cell) = self.cells.get_mut(&cell_id) else {
+            return Err(EngineError::NotFound);
+        };
+
+        cell.content = new_content;
+        self.dirty_cells.insert(cell_id);
+        Ok(())
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        for cell_id in self.dirty_cells.clone() {
+            let cell = self
+                .cells
+                .get(&cell_id)
+                .cloned()
+                .ok_or(EngineError::NotFound)?;
+            let saved = self.engine.update_cell_and_refresh(&cell)?;
+            self.cells.insert(cell_id, saved);
+        }
+
+        self.dirty_cells.clear();
+        self.engine.refresh_context_cache(self.root_id)?;
+        Ok(())
+    }
 }
 
 impl Engine {
@@ -50,17 +95,22 @@ impl Engine {
         let storage = SqliteStorage::new(db_path, config.temporal_fabric_edges)?;
         Ok(Self {
             storage: Box::new(storage),
+            context_cache: RefCell::new(HashMap::new()),
         })
     }
 
     pub fn from_storage(storage: Box<dyn Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            context_cache: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn with_postgres_config(connection_str: &str, config: EngineConfig) -> Result<Self> {
         let storage = PostgresStorage::new(connection_str, config.temporal_fabric_edges)?;
         Ok(Self {
             storage: Box::new(storage),
+            context_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -68,6 +118,7 @@ impl Engine {
         let storage = MySqlStorage::new(connection_str, config.temporal_fabric_edges)?;
         Ok(Self {
             storage: Box::new(storage),
+            context_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -75,7 +126,18 @@ impl Engine {
         let storage = MariaDbStorage::new(connection_str, config.temporal_fabric_edges)?;
         Ok(Self {
             storage: Box::new(storage),
+            context_cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    fn clear_context_cache(&self) {
+        self.context_cache.borrow_mut().clear();
+    }
+
+    fn refresh_context_cache(&self, fabric_id: Uuid) -> Result<()> {
+        let context = self.build_context_with_timestamp(fabric_id, None)?;
+        self.context_cache.borrow_mut().insert(fabric_id, context);
+        Ok(())
     }
 
     fn now_ts(&self) -> Result<i64> {
@@ -110,6 +172,7 @@ impl Engine {
         };
 
         self.storage.insert_cell(&cell)?;
+        self.clear_context_cache();
 
         Ok(cell)
     }
@@ -123,6 +186,7 @@ impl Engine {
         cell.valid_from = now;
         cell.valid_to = self.storage.open_ended_valid_to();
         self.storage.insert_cell(&cell)?;
+        self.clear_context_cache();
 
         Ok(cell)
     }
@@ -172,6 +236,7 @@ impl Engine {
         cell.valid_from = now;
         cell.valid_to = self.storage.open_ended_valid_to();
         self.storage.insert_cell(&cell)?;
+        self.clear_context_cache();
 
         Ok(cell)
     }
@@ -214,6 +279,7 @@ impl Engine {
 
         let now = self.now_ts()?;
         self.storage.insert_edge(&edge, now)?;
+        self.clear_context_cache();
 
         Ok(())
     }
@@ -228,6 +294,11 @@ impl Engine {
     }
 
     pub fn update_cell(&self, cell: &Cell) -> Result<()> {
+        self.update_cell_and_refresh(cell)?;
+        Ok(())
+    }
+
+    fn update_cell_and_refresh(&self, cell: &Cell) -> Result<Cell> {
         let now = self.reserve_now_for_cell(cell.id)?;
 
         self.storage.close_active_version(cell.id, now)?;
@@ -242,24 +313,72 @@ impl Engine {
         };
 
         self.storage.insert_cell(&next)?;
+        self.clear_context_cache();
 
-        Ok(())
+        Ok(next)
+    }
+
+    pub fn open_document_context(
+        &self,
+        fabric_id: Uuid,
+        timestamp: Option<i64>,
+    ) -> Result<DocumentContext<'_>> {
+        let context = self.build_context_with_timestamp(fabric_id, timestamp)?;
+        let mut cells = HashMap::new();
+        for cell in context.cells {
+            cells.insert(cell.id, cell);
+        }
+
+        Ok(DocumentContext {
+            engine: self,
+            root_id: context.root.id,
+            cells,
+            dirty_cells: HashSet::new(),
+        })
+    }
+
+    pub fn get_cell_at(&self, id: Uuid, timestamp: Option<i64>) -> Result<Cell> {
+        let resolved_ts = match timestamp {
+            Some(value) => value,
+            None => self.now_ts()?,
+        };
+
+        self.storage.get_cell_at(id, resolved_ts)
     }
 
     pub fn get_current(&self, id: Uuid) -> Result<Cell> {
-        self.storage.get_cell_at(id, self.now_ts()?)
+        self.get_cell_at(id, None)
     }
 
     pub fn get_at_time(&self, id: Uuid, timestamp: i64) -> Result<Cell> {
-        self.storage.get_cell_at(id, timestamp)
+        self.get_cell_at(id, Some(timestamp))
     }
 
     pub fn build_context(&self, fabric_id: Uuid) -> Result<FabricContext> {
-        self.build_context_at_time(fabric_id, self.now_ts()?)
+        self.build_context_with_timestamp(fabric_id, None)
     }
 
     pub fn build_context_at_time(&self, fabric_id: Uuid, timestamp: i64) -> Result<FabricContext> {
-        let root = self.get_at_time(fabric_id, timestamp)?;
+        self.build_context_with_timestamp(fabric_id, Some(timestamp))
+    }
+
+    pub fn build_context_with_timestamp(
+        &self,
+        fabric_id: Uuid,
+        timestamp: Option<i64>,
+    ) -> Result<FabricContext> {
+        if timestamp.is_none() {
+            if let Some(cached) = self.context_cache.borrow().get(&fabric_id).cloned() {
+                return Ok(cached);
+            }
+        }
+
+        let resolved_ts = match timestamp {
+            Some(value) => value,
+            None => self.now_ts()?,
+        };
+
+        let root = self.get_at_time(fabric_id, resolved_ts)?;
 
         let mut seen: HashSet<Uuid> = HashSet::new();
         let mut queue = VecDeque::new();
@@ -271,10 +390,10 @@ impl Engine {
         queue.push_back(root.id);
 
         while let Some(parent_id) = queue.pop_front() {
-            let parent_edges = self.storage.get_edges_for_parent(parent_id, timestamp)?;
+            let parent_edges = self.storage.get_edges_for_parent(parent_id, resolved_ts)?;
             for edge in parent_edges {
                 if seen.insert(edge.child_id) {
-                    let child = self.get_at_time(edge.child_id, timestamp)?;
+                    let child = self.get_at_time(edge.child_id, resolved_ts)?;
                     cells.push(child);
                     queue.push_back(edge.child_id);
                 }
@@ -282,7 +401,14 @@ impl Engine {
             }
         }
 
-        Ok(FabricContext { root, edges, cells })
+        let context = FabricContext { root, edges, cells };
+        if timestamp.is_none() {
+            self.context_cache
+                .borrow_mut()
+                .insert(fabric_id, context.clone());
+        }
+
+        Ok(context)
     }
 
     pub fn get_cell(&self, id: Uuid) -> Result<Cell> {
