@@ -20,7 +20,7 @@ pub mod storage;
 pub use engine::{DocumentContext, Engine, EngineConfig};
 pub use error::{EngineError, Result};
 pub use models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricContext, FabricEdge, RelationType,
-    VersionCandidate,
+    Cell, CellType, ConflictStrategy, ContentFormat, Document, FabricContext, FabricEdge,
+    RelationType, VersionCandidate,
 };
 pub use storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};
