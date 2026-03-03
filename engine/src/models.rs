@@ -26,6 +26,8 @@ pub struct Cell {
     pub children: Vec<Uuid>, // Maintains sequence of child cells
 }
 
+pub type Document = Cell;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RelationType {
     Contains,

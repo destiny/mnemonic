@@ -23,8 +23,8 @@ pub use document::{Document, DocumentKind};
 pub use engine::{DocumentContext, Engine, EngineConfig};
 pub use error::{EngineError, Result};
 pub use models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricContext, FabricEdge, RelationType,
-    VersionCandidate,
+    Cell, CellType, ConflictStrategy, ContentFormat, Document, FabricContext, FabricEdge,
+    RelationType, VersionCandidate,
 };
 pub use service::context::ServiceContext;
 pub use service::{DictionaryEntryInput, Service, ServiceApi};
