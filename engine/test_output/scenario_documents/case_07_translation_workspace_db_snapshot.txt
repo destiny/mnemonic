@@ -2,8 +2,8 @@ Scenario Snapshot
 case_id=case_07
 document_type=translation_workspace
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019caed6-e28a-70c2-920b-e956da4eadc8
-purpose_id=019caed6-e28c-7e90-ae2d-08fe8ba8d121
+root_id=019cdd4a-f048-7a40-9c22-1658859e0a00
+purpose_id=019cdd4a-f049-7703-9613-a261ed62d053
 section_count=6
 reference_count=120
 tag_count=7

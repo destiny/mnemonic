@@ -2,8 +2,8 @@ Scenario Snapshot
 case_id=case_01
 document_type=technical_document
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019caed6-df04-7181-8031-c8c769e8c3f5
-purpose_id=019caed6-df06-76f3-927e-7f73aeafe8c3
+root_id=019cdd4a-edfb-7b63-ba81-4c307f79dbec
+purpose_id=019cdd4a-edfd-7341-b60a-d4827cefe5cc
 section_count=5
 reference_count=40
 tag_count=8

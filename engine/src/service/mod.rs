@@ -11,7 +11,7 @@ use crate::document::extensions::{dictionary, table, text};
 use crate::document::{Document, DocumentKind};
 use crate::engine::Engine;
 use crate::error::{EngineError, Result};
-use crate::models::{CellType, ContentFormat, RelationType};
+use crate::models::{CellType, ContentFormat, RelationType, Timestamp};
 use context::ServiceContext;
 
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct DictionaryEntryInput {
 
 pub trait ServiceApi {
     fn create_document_context(&self, kind: DocumentKind) -> Result<ServiceContext>;
-    fn open_context(&self, document_id: Uuid, timestamp: Option<i64>) -> Result<ServiceContext>;
+    fn open_context(&self, document_id: Uuid, timestamp: Option<Timestamp>) -> Result<ServiceContext>;
     fn detect_kind(&self, document_id: Uuid) -> Result<DocumentKind>;
 }
 
@@ -42,8 +42,8 @@ impl<'a> Service<'a> {
             ContentFormat::Text,
             segment.as_bytes().to_vec(),
         )?;
-        self.engine.add_relation(
-            context.document.id,
+        self.engine.add_fabric_cell(
+            context.document.root_cell_id,
             cell.id,
             text::contains_relation(),
             None,
@@ -73,8 +73,8 @@ impl<'a> Service<'a> {
             ContentFormat::Text,
             value.as_bytes().to_vec(),
         )?;
-        self.engine.add_relation(
-            context.document.id,
+        self.engine.add_fabric_cell(
+            context.document.root_cell_id,
             cell.id,
             table::table_cell_relation(),
             Some(ordinal),
@@ -94,8 +94,8 @@ impl<'a> Service<'a> {
             ContentFormat::Text,
             entry.key.as_bytes().to_vec(),
         )?;
-        self.engine.add_relation(
-            context.document.id,
+        self.engine.add_fabric_cell(
+            context.document.root_cell_id,
             key_cell.id,
             dictionary::key_relation(),
             None,
@@ -107,7 +107,7 @@ impl<'a> Service<'a> {
                 ContentFormat::Text,
                 value.as_bytes().to_vec(),
             )?;
-            self.engine.add_relation(
+            self.engine.add_fabric_cell(
                 key_cell.id,
                 value_cell.id,
                 dictionary::value_relation(),
@@ -124,13 +124,13 @@ impl<'a> Service<'a> {
         let text_ctx = self.create_document_context(DocumentKind::Text)?;
         let key_ids = self
             .engine
-            .get_children_by_relation(context.document.id, dictionary::key_relation())?;
+            .get_cells_by_relation(context.document.root_cell_id, dictionary::key_relation())?;
 
         for key_id in key_ids {
             let key = self.engine.get_current(key_id)?;
             let values = self
                 .engine
-                .get_children_by_relation(key_id, dictionary::value_relation())?;
+                .get_cells_by_relation(key_id, dictionary::value_relation())?;
 
             for value_id in values {
                 let value = self.engine.get_current(value_id)?;
@@ -143,15 +143,15 @@ impl<'a> Service<'a> {
             }
         }
 
-        self.engine.add_relation(
-            text_ctx.document.id,
-            context.document.id,
+        self.engine.add_fabric_cell(
+            text_ctx.document.root_cell_id,
+            context.document.root_cell_id,
             RelationType::DerivesFrom,
             None,
         )?;
-        self.engine.add_relation(
-            context.document.id,
-            text_ctx.document.id,
+        self.engine.add_fabric_cell(
+            context.document.root_cell_id,
+            text_ctx.document.root_cell_id,
             dictionary::derived_text_relation(),
             None,
         )?;
@@ -165,7 +165,7 @@ impl<'a> Service<'a> {
         }
         Err(EngineError::InvalidData(format!(
             "document {} is kind {:?}, expected {:?}",
-            context.document.id, context.document.kind, expected
+            context.document.root_cell_id, context.document.kind, expected
         )))
     }
 }
@@ -182,7 +182,7 @@ impl ServiceApi for Service<'_> {
         Ok(ServiceContext::new(document, None))
     }
 
-    fn open_context(&self, document_id: Uuid, timestamp: Option<i64>) -> Result<ServiceContext> {
+    fn open_context(&self, document_id: Uuid, timestamp: Option<Timestamp>) -> Result<ServiceContext> {
         let root = self.engine.get_cell_at(document_id, timestamp)?;
         let document = Document::from_cell(&root).ok_or_else(|| {
             EngineError::InvalidData(format!(

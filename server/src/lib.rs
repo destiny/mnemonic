@@ -5,10 +5,11 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post},
 };
+use chrono::{DateTime, NaiveDateTime, Utc};
 use mnemonic_engine::{
-    CellType, ContentFormat, Document, Engine, EngineError, Result as EngineResult,
+    Cell, CellType, ContentFormat, Engine, EngineError, Result as EngineResult, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,7 +26,7 @@ impl AppContext {
         }
     }
 
-    fn with_engine<T>(&self, f: impl FnOnce(&Engine) -> EngineResult<T>) -> ApiResult<T> {
+    fn with_engine<T>(&self, f: impl FnOnce(&Engine) -> EngineResult<T>) -> Result<T, ApiError> {
         let guard = self
             .engine
             .lock()
@@ -85,6 +86,21 @@ impl From<EngineError> for ApiError {
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DocumentResponse {
+    pub root_cell_id: Uuid,
+    pub root: Cell,
+}
+
+impl DocumentResponse {
+    fn from_root(root: Cell) -> Self {
+        Self {
+            root_cell_id: root.id,
+            root,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiRoute {
     method: &'static str,
@@ -112,7 +128,18 @@ pub struct UpdateDocumentRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct DocumentHistoryQuery {
-    pub timestamp: Option<i64>,
+    pub timestamp: Option<String>,
+}
+
+fn parse_timestamp(value: &str) -> Result<Timestamp, ApiError> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+        .map_err(|err| ApiError::bad_request(format!("invalid timestamp '{value}': {err}")))?;
+    Ok(DateTime::<Utc>::from_utc(naive, Utc))
 }
 
 pub fn router(context: AppContext) -> Router {
@@ -175,7 +202,7 @@ async fn health() -> Json<HealthResponse> {
 async fn create_document(
     State(context): State<AppContext>,
     Json(request): Json<CreateDocumentRequest>,
-) -> ApiResult<Document> {
+) -> ApiResult<DocumentResponse> {
     let doc = context.with_engine(|engine| {
         engine.create_cell(
             request.cell_type,
@@ -183,37 +210,38 @@ async fn create_document(
             request.content.into_bytes(),
         )
     })?;
-    Ok(Json(doc))
+    Ok(Json(DocumentResponse::from_root(doc)))
 }
 
 async fn get_document(
     State(context): State<AppContext>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Document> {
+) -> ApiResult<DocumentResponse> {
     let doc = context.with_engine(|engine| engine.get_current(id))?;
-    Ok(Json(doc))
+    Ok(Json(DocumentResponse::from_root(doc)))
 }
 
 async fn update_document(
     State(context): State<AppContext>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateDocumentRequest>,
-) -> ApiResult<Document> {
+) -> ApiResult<DocumentResponse> {
     let doc = context
         .with_engine(|engine| engine.update_cell_content(id, request.content.into_bytes()))?;
-    Ok(Json(doc))
+    Ok(Json(DocumentResponse::from_root(doc)))
 }
 
 async fn get_document_history(
     State(context): State<AppContext>,
     Path(id): Path<Uuid>,
     Query(query): Query<DocumentHistoryQuery>,
-) -> ApiResult<Document> {
+) -> ApiResult<DocumentResponse> {
     let Some(timestamp) = query.timestamp else {
         return Err(ApiError::bad_request(
             "timestamp query parameter is required",
         ));
     };
-    let doc = context.with_engine(|engine| engine.get_at_time(id, timestamp))?;
-    Ok(Json(doc))
+    let parsed = parse_timestamp(&timestamp)?;
+    let doc = context.with_engine(|engine| engine.get_at_time(id, parsed))?;
+    Ok(Json(DocumentResponse::from_root(doc)))
 }

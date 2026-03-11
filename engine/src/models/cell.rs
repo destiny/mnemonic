@@ -12,56 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub type Timestamp = DateTime<Utc>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cell {
     pub id: Uuid,
     pub cell_type: CellType,
     pub format: ContentFormat,
-    pub content: Vec<u8>,    // Use Vec<u8> to store both text and binary data
-    pub valid_from: i64,     // epoch timestamp (integer)
-    pub valid_to: i64,       // epoch timestamp (integer)
-    pub children: Vec<Uuid>, // Maintains sequence of child cells
-}
-
-pub type Document = Cell;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RelationType {
-    Contains,
-    References,
-    DerivesFrom,
-    Custom(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FabricEdge {
-    pub parent_id: Uuid,
-    pub child_id: Uuid,
-    pub relation_type: RelationType,
-    pub ordinal: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FabricContext {
-    pub root: Cell,
-    pub edges: Vec<FabricEdge>,
-    pub cells: Vec<Cell>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ConflictStrategy {
-    LastWriteWins,
-    LogicalClock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VersionCandidate {
-    pub content: Vec<u8>,
-    pub timestamp: i64,
-    pub logical_clock: Option<u64>,
+    pub content: Vec<u8>, // Use Vec<u8> to store both text and binary data
+    pub valid_from: Timestamp,
+    pub valid_to: Timestamp,
+    pub fabric_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -72,7 +72,7 @@ fn seed_document(engine: &Engine, seed: &DocumentSeed) -> StoredDocument {
             .unwrap();
 
         engine
-            .add_relation(
+            .add_fabric_cell(
                 root.id,
                 section_cell.id,
                 RelationType::Contains,
@@ -93,7 +93,7 @@ fn seed_document(engine: &Engine, seed: &DocumentSeed) -> StoredDocument {
             .unwrap();
 
         engine
-            .add_relation(
+            .add_fabric_cell(
                 root.id,
                 reference_cell.id,
                 RelationType::References,
@@ -204,12 +204,12 @@ fn generates_and_roundtrips_large_use_case_documents() {
         let fetch_ms = fetch_start.elapsed().as_millis();
 
         let contains = context
-            .edges
+            .fabric_cells
             .iter()
             .filter(|e| e.relation_type == RelationType::Contains)
             .count();
         let references = context
-            .edges
+            .fabric_cells
             .iter()
             .filter(|e| e.relation_type == RelationType::References)
             .count();

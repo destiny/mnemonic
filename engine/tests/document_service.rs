@@ -18,15 +18,17 @@ fn context_and_kind_are_distinguishable_for_routing() {
         .unwrap();
 
     assert_eq!(
-        service.detect_kind(text.document.id).unwrap(),
+        service.detect_kind(text.document.root_cell_id).unwrap(),
         DocumentKind::Text
     );
     assert_eq!(
-        service.detect_kind(table.document.id).unwrap(),
+        service.detect_kind(table.document.root_cell_id).unwrap(),
         DocumentKind::Table
     );
     assert_eq!(
-        service.detect_kind(dictionary.document.id).unwrap(),
+        service
+            .detect_kind(dictionary.document.root_cell_id)
+            .unwrap(),
         DocumentKind::Dictionary
     );
 }
@@ -42,7 +44,7 @@ fn text_document_keeps_segment_order_via_context() {
     service.append_text_segment(&context, "gamma").unwrap();
 
     let children = engine
-        .get_children_by_relation(context.document.id, RelationType::Contains)
+        .get_cells_by_relation(context.document.root_cell_id, RelationType::Contains)
         .unwrap();
     assert_eq!(children.len(), 3);
 }
@@ -82,7 +84,7 @@ fn dictionary_transforms_to_text_with_lineage() {
     assert_eq!(text_ctx.document.kind, DocumentKind::Text);
 
     let derives_from = engine
-        .get_children_by_relation(text_ctx.document.id, RelationType::DerivesFrom)
+        .get_cells_by_relation(text_ctx.document.root_cell_id, RelationType::DerivesFrom)
         .unwrap();
-    assert_eq!(derives_from, vec![dictionary_ctx.document.id]);
+    assert_eq!(derives_from, vec![dictionary_ctx.document.root_cell_id]);
 }

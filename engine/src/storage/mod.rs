@@ -15,41 +15,51 @@
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::models::{Cell, FabricEdge, RelationType};
+use crate::models::{Cell, FabricCell, RelationType, Timestamp};
 
 pub mod mariadb;
 pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
+pub mod time;
 
 pub use mariadb::MariaDbStorage;
 pub use mysql::MySqlStorage;
 pub use postgres::PostgresStorage;
 pub use sqlite::SqliteStorage;
 
-pub trait Storage {
-    fn current_timestamp(&self) -> Result<i64>;
+pub trait Storage: Send + Sync {
+    fn current_query_timestamp(&self) -> Result<Timestamp>;
 
-    fn open_ended_valid_to(&self) -> i64;
+    fn active_valid_to_sentinel(&self) -> Timestamp;
 
     fn insert_cell(&self, cell: &Cell) -> Result<()>;
 
-    fn reserve_update_timestamp(&self, id: Uuid, candidate_ts: i64) -> Result<i64>;
-
-    fn get_cell_at(&self, id: Uuid, ts: i64) -> Result<Cell>;
-
-    fn close_active_version(&self, id: Uuid, now_ts: i64) -> Result<()>;
-
-    fn insert_edge(&self, edge: &FabricEdge, now_ts: i64) -> Result<()>;
-
-    fn next_relation_ordinal(&self, parent_id: Uuid, relation_type: &RelationType) -> Result<i64>;
-
-    fn get_children_by_relation(
+    fn reserve_next_version_timestamp(
         &self,
-        parent_id: Uuid,
+        id: Uuid,
+        candidate_ts: Timestamp,
+    ) -> Result<Timestamp>;
+
+    fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell>;
+
+    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()>;
+
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()>;
+
+    fn next_relation_ordinal(
+        &self,
+        fabric_id: Uuid,
         relation_type: &RelationType,
-        ts: i64,
+        ts: Timestamp,
+    ) -> Result<i64>;
+
+    fn get_cells_by_relation(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+        ts: Timestamp,
     ) -> Result<Vec<Uuid>>;
 
-    fn get_edges_for_parent(&self, parent_id: Uuid, ts: i64) -> Result<Vec<FabricEdge>>;
+    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>>;
 }

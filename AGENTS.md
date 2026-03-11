@@ -9,12 +9,12 @@
 
 ## Vision
 
-Mnemonic Engine is a local-first, temporal, structured knowledge engine built around atomic `Cell` entities and relational `Fabric`.
+Mnemonic Engine is a local-first, temporal, structured knowledge engine built around atomic `Cell` entities and structural `Fabric`.
 
 Core objective:
 
 - Store small, atomic data units (`Cell`)
-- Connect units through `Fabric`
+- Organize units through `Fabric`
 - Preserve full history with temporal versioning
 - Reconstruct deterministic state at any point in time
 
@@ -42,11 +42,12 @@ Fields:
 - `content` (payload)
 - `valid_from`
 - `valid_to`
+- `fabric_id` (optional reference to a `Fabric` when the cell owns structured content)
 
 Versioning and keys:
 
 - Composite primary key: `(id, valid_to)`
-- Canonical open-ended sentinel for new active rows: `valid_to = MAX_TIME`
+- Canonical open-ended sentinel for a live row: `valid_to = FUTURE_TIME`
 
 Invariant:
 
@@ -54,19 +55,37 @@ Invariant:
 
 ### Fabric
 
-`Fabric` represents relationships among `Cell` entities.
+`Fabric` represents the structure that contains and orders `Cell` entities.
+
+Canonical meaning:
+
+- A `Fabric` is built from cells
+- A `Fabric` contains cells
+- A `Fabric` preserves order among its member cells
+- A `Fabric` is a logical structure, not a separate application root
+
+Logical model:
+
+- `Cell` may reference one `Fabric`
+- `Fabric` contains an ordered collection of `Cell`
+- Ordering is part of the logical model
+- Storage implementation for ordering is a data-layer concern
+
+Preferred logic-layer wording:
+
+- Use `Cell`, `Fabric`, and `FabricCell`
+- Do not introduce graph-specific wording such as `Edge` unless the system is explicitly being modeled as a graph engine
 
 Storage model:
 
-- `fabric_cell`: fabric node metadata
-- `fabric_edge`: relationships between cells/fabrics
+- `fabric_cell`: fabric metadata
+- `fabric_cells`: membership and ordering of cells inside a fabric
 
 Supported structures:
 
 - Set (unordered, no duplicates)
-- List (ordered, duplicates allowed)
-- Graph (typed edges via `relation_type`)
-- Nested fabric (fabric referencing fabric)
+- List (ordered, duplicates allowed when the use case allows it)
+- Nested fabric (through cells that reference a fabric)
 
 Typical uses:
 
@@ -74,6 +93,39 @@ Typical uses:
 - Product specifications
 - Research structures
 - Narrative or other hierarchical compositions
+
+### Document
+
+`Document` is the API/application root concept.
+
+Canonical meaning:
+
+- A `Document` owns one root `Cell`
+- The root `Cell` may reference a `Fabric`
+- The `Fabric` contains the ordered `Cell` collection that forms the document structure
+- `Document` is the public usage model for application and API flows
+
+Extension model:
+
+- `Document` is the root of usage types exposed by the API
+- Specialized forms such as text, table, dictionary, list, and map are document extensions
+- `Cell` and `Fabric` remain the engine-layer primitives that power those extensions
+
+## Naming Policy
+
+Three naming layers must remain distinct:
+
+- Engine layer: `Cell`, `Fabric`
+- API/application layer: `Document`
+- Data layer: storage-oriented names such as `data_cell`, `meta_cell`, `fabric_cell`, `fabric_cells`
+
+Rules:
+
+- Do not introduce extra conceptual nouns that blur the model
+- Do not use storage terminology to redefine engine concepts
+- Do not use graph terminology such as `edge` in the main logic model unless graph semantics are intentionally first-class
+- Keep storage names focused on persistence shape and efficiency
+- Keep API names focused on application usage and user-facing behavior
 
 ## Temporal Model
 
@@ -85,20 +137,25 @@ Each version is valid in the interval:
 
 Active version:
 
-- `valid_from <= now < valid_to`
+- `valid_from <= CURRENT_TIMESTAMP < valid_to`
 
 Current-version query rule:
 
-- Query using time window semantics: `valid_from <= now AND valid_to > now`
-- Do not require `valid_to = MAX_TIME` for reads
-- `MAX_TIME` remains the canonical write sentinel for open-ended rows
+- Query using database time window semantics: `valid_from <= NOW() AND valid_to > NOW()`
+- Do not require equality against the sentinel value for reads
+- The sentinel value is only the default future end point for a live row
 
 Update algorithm (canonical):
 
-1. Close current active row by setting `valid_to = now`
+1. Close current active row by setting `valid_to = NOW()`
 2. Insert new row with:
-   - `valid_from = now`
-   - `valid_to = MAX_TIME`
+   - `valid_from = NOW()`
+   - `valid_to = FUTURE_TIME`
+
+Delete algorithm (canonical):
+
+1. Close current active row by setting `valid_to = NOW()`
+2. Do not insert a replacement row
 
 Guarantees:
 
@@ -145,10 +202,16 @@ Schema is intended to remain portable.
 
 ### Time Representation
 
-- Integer timestamp (`epoch ms` or `epoch us`)
-- `MAX_TIME = i64::MAX`
+- Database-native temporal types are preferred
+- `valid_from` and `valid_to` may use `DATETIME` or `TIMESTAMP`
+- Use the database current-time function such as `NOW()` or `CURRENT_TIMESTAMP()` for current-state comparisons
+- Use a configured future sentinel such as `2100-01-01 00:00:00` or the maximum practical timestamp supported by the database
 
-Do not store temporal fields as datetime strings.
+Guidance:
+
+- The data layer should own the exact temporal column type and default values
+- The logic layer should rely on validity-window semantics, not hard-code database time expressions
+- Rust may use integers or other time representations internally when needed, but that should not redefine the database temporal model
 
 ### Tables
 
@@ -157,12 +220,15 @@ Core tables:
 - `data_cell`
 - `meta_cell`
 - `fabric_cell`
-- `fabric_edge`
+- `fabric_cells`
 
 Notes:
 
 - Cell tables are temporal
-- `fabric_edge` may be temporal or non-temporal based on configuration
+- `fabric_cells` stores fabric membership and ordering
+- Ordering may be implemented with ordinal position, linked-list style pointers, or tree-style indexing
+- Storage strategy must not change the logical meaning of `Fabric` as an ordered collection of cells
+- Temporal defaults and current-time evaluation belong to the database layer
 
 Optional table:
 
@@ -184,8 +250,8 @@ Implemented in Rust.
 Responsibility split:
 
 - Database = storage/invariant substrate
-- Engine = domain logic and deterministic behavior
-- Intelligent layer = unified `Cell` abstraction across usage types
+- Engine = `Cell` / `Fabric` domain logic and deterministic behavior
+- API/application layer = `Document` as the public root across usage types
 - Storage layer = performance-oriented schemas, including specialized tables for major usage patterns
 
 ### API Exposure (Planned)
@@ -200,7 +266,8 @@ Engine remains the authoritative state layer.
 
 The model is logically unified and physically optimized:
 
-- Logical/intelligent model: all data is treated as `Cell` under one conceptual API
+- Logical/engine model: data is built from `Cell` and organized through `Fabric`
+- API/application model: usage is exposed through `Document`
 - Physical/storage model: major usage categories can use dedicated tables to maximize performance and feature support
 - Requirement: specialized tables must still follow temporal invariants and deterministic reconstruction rules
 
@@ -208,15 +275,21 @@ The model is logically unified and physically optimized:
 
 Current-state reconstruction (`now`):
 
-1. Fetch active fabric
-2. Fetch active edges
-3. Fetch active cells
-4. Assemble in memory
+1. Resolve the root `Cell`
+2. Resolve the referenced active `Fabric` if present
+3. Fetch active `fabric_cells`
+4. Fetch active cells in document order
+5. Assemble in memory
 
 Query rule:
 
-- Current state: filter by window (`valid_from <= now AND valid_to > now`)
-- Historical state: filter by time window (`valid_from <= T < valid_to`)
+- Current state: filter by database time window (`valid_from <= NOW() AND valid_to > NOW()`)
+- Historical state: filter by time window (`valid_from <= :time_point AND valid_to > :time_point`)
+
+Database rule:
+
+- For a temporal item such as `Cell` or `Fabric`, the live row is the row whose validity window contains the current database time
+- A uniqueness constraint or primary key using `(id, valid_to)` ensures there is only one live row for an item under the canonical future sentinel policy
 
 Expected engine methods:
 

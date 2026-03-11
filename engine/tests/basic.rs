@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use chrono::{TimeZone, Utc};
 
 use mnemonic_engine::{
-    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, RelationType, VersionCandidate,
+    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, RelationType, Timestamp,
+    VersionCandidate,
 };
 
 // Black-box specification baseline derived from AGENTS.md.
@@ -28,11 +29,8 @@ const SPEC_RULES: &[&str] = &[
     "Conflicts are resolved before promoting a new active version",
 ];
 
-fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
+fn now_ts() -> Timestamp {
+    Utc::now()
 }
 
 #[test]
@@ -87,12 +85,12 @@ fn spec_conflict_resolution_deterministic() {
 
     let local = VersionCandidate {
         content: b"local".to_vec(),
-        timestamp: 100,
+        timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         logical_clock: Some(3),
     };
     let remote = VersionCandidate {
         content: b"remote".to_vec(),
-        timestamp: 200,
+        timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
         logical_clock: Some(2),
     };
 
@@ -113,11 +111,11 @@ fn spec_conflict_resolution_deterministic() {
 }
 
 #[test]
-fn spec_temporal_fabric_edges_when_enabled() {
+fn spec_temporal_fabric_cells_when_enabled() {
     let engine = Engine::with_config(
         ":memory:",
         EngineConfig {
-            temporal_fabric_edges: true,
+            temporal_fabric_cells: true,
         },
     )
     .unwrap();
@@ -133,7 +131,7 @@ fn spec_temporal_fabric_edges_when_enabled() {
         .unwrap();
 
     engine
-        .add_relation(parent.id, first.id, RelationType::Contains, Some(0))
+        .add_fabric_cell(parent.id, first.id, RelationType::Contains, Some(0))
         .unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -141,16 +139,26 @@ fn spec_temporal_fabric_edges_when_enabled() {
     std::thread::sleep(std::time::Duration::from_millis(2));
 
     engine
-        .add_relation(parent.id, second.id, RelationType::Contains, Some(0))
+        .add_fabric_cell(parent.id, second.id, RelationType::Contains, Some(0))
         .unwrap();
 
     let historical = engine
         .build_context_at_time(parent.id, t_before_switch)
         .unwrap();
-    assert!(historical.edges.iter().any(|e| e.child_id == first.id));
+    assert!(
+        historical
+            .fabric_cells
+            .iter()
+            .any(|entry| entry.cell_id == first.id)
+    );
 
     let current = engine.build_context(parent.id).unwrap();
-    assert!(current.edges.iter().any(|e| e.child_id == second.id));
+    assert!(
+        current
+            .fabric_cells
+            .iter()
+            .any(|entry| entry.cell_id == second.id)
+    );
 }
 
 #[test]
@@ -171,14 +179,18 @@ fn e2e_lifecycle_black_box_acceptance() {
         .create_cell(CellType::Container, ContentFormat::Json, vec![])
         .unwrap();
 
-    engine.add_child(container.id, raw.id).unwrap();
-    engine.add_child(container.id, digested.id).unwrap();
     engine
-        .add_relation(digested.id, raw.id, RelationType::DerivesFrom, None)
+        .add_fabric_cell(container.id, raw.id, RelationType::Contains, None)
+        .unwrap();
+    engine
+        .add_fabric_cell(container.id, digested.id, RelationType::Contains, None)
+        .unwrap();
+    engine
+        .add_fabric_cell(digested.id, raw.id, RelationType::DerivesFrom, None)
         .unwrap();
 
     let contains = engine
-        .get_children_by_relation(container.id, RelationType::Contains)
+        .get_cells_by_relation(container.id, RelationType::Contains)
         .unwrap();
     assert_eq!(contains, vec![raw.id, digested.id]);
 
@@ -210,7 +222,9 @@ fn context_defers_writes_until_save() {
     let child = engine
         .create_cell(CellType::Raw, ContentFormat::Text, b"original".to_vec())
         .unwrap();
-    engine.add_child(root.id, child.id).unwrap();
+    engine
+        .add_fabric_cell(root.id, child.id, RelationType::Contains, None)
+        .unwrap();
 
     let mut context = engine.open_document_context(root.id, None).unwrap();
     context

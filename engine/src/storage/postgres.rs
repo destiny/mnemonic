@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, FabricEdge, RelationType};
+use crate::models::{Cell, CellType, FabricCell, RelationType, Timestamp};
+use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time, future_sentinel};
 
 #[derive(Debug, Clone, Copy)]
 enum CellTable {
@@ -38,17 +39,15 @@ impl CellTable {
 
 pub struct PostgresStorage {
     client: Mutex<Client>,
-    temporal_fabric_edges: bool,
+    temporal_fabric_cells: bool,
 }
 
-const POSTGRES_OPEN_ENDED_VALID_TO: i64 = i64::MAX;
-
 impl PostgresStorage {
-    pub fn new(connection_str: &str, temporal_fabric_edges: bool) -> Result<Self> {
+    pub fn new(connection_str: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let client = Client::connect(connection_str, NoTls)?;
         let storage = Self {
             client: Mutex::new(client),
-            temporal_fabric_edges,
+            temporal_fabric_cells,
         };
         storage.init()?;
         Ok(storage)
@@ -74,9 +73,9 @@ impl PostgresStorage {
                     cell_type TEXT NOT NULL,
                     format TEXT NOT NULL,
                     content BYTEA NOT NULL,
-                    valid_from BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT,
-                    valid_to BIGINT NOT NULL DEFAULT 9223372036854775807,
-                    children TEXT NOT NULL,
+                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
+                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
+                    fabric_id TEXT,
                     PRIMARY KEY (id, valid_to)
                 );
 
@@ -85,40 +84,40 @@ impl PostgresStorage {
                     cell_type TEXT NOT NULL,
                     format TEXT NOT NULL,
                     content BYTEA NOT NULL,
-                    valid_from BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT,
-                    valid_to BIGINT NOT NULL DEFAULT 9223372036854775807,
-                    children TEXT NOT NULL,
+                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
+                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
+                    fabric_id TEXT,
                     PRIMARY KEY (id, valid_to)
                 );
 
                 CREATE TABLE IF NOT EXISTS fabric_cell (
                     id TEXT NOT NULL,
-                    valid_from BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT,
-                    valid_to BIGINT NOT NULL DEFAULT 9223372036854775807,
+                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
+                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
                     PRIMARY KEY (id, valid_to)
                 );
 
-                CREATE TABLE IF NOT EXISTS fabric_edge (
-                    parent_id TEXT NOT NULL,
-                    child_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS fabric_cells (
+                    fabric_id TEXT NOT NULL,
+                    cell_id TEXT NOT NULL,
                     relation_type TEXT NOT NULL,
                     ordinal BIGINT NOT NULL,
-                    valid_from BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT,
-                    valid_to BIGINT NOT NULL DEFAULT 9223372036854775807,
-                    PRIMARY KEY (parent_id, relation_type, ordinal, valid_to)
+                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
+                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
+                    PRIMARY KEY (fabric_id, relation_type, ordinal, valid_to)
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS data_cell_one_active_per_id
                 ON data_cell(id)
-                WHERE valid_to = 9223372036854775807;
+                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
 
                 CREATE UNIQUE INDEX IF NOT EXISTS meta_cell_one_active_per_id
                 ON meta_cell(id)
-                WHERE valid_to = 9223372036854775807;
+                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
 
-                CREATE UNIQUE INDEX IF NOT EXISTS fabric_edge_one_active_per_slot
-                ON fabric_edge(parent_id, relation_type, ordinal)
-                WHERE valid_to = 9223372036854775807;
+                CREATE UNIQUE INDEX IF NOT EXISTS fabric_cells_one_active_per_slot
+                ON fabric_cells(fabric_id, relation_type, ordinal)
+                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
                 ",
             )?;
             Ok(())
@@ -126,11 +125,10 @@ impl PostgresStorage {
     }
 
     fn insert_cell_in_table(&self, table: CellTable, cell: &Cell) -> Result<()> {
-        let children = serde_json::to_string(&cell.children)?;
         let cell_type = serde_json::to_string(&cell.cell_type)?;
         let format = serde_json::to_string(&cell.format)?;
         let sql = format!(
-            "INSERT INTO {} (id, cell_type, format, content, valid_from, valid_to, children)
+            "INSERT INTO {} (id, cell_type, format, content, valid_from, valid_to, fabric_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
             table.as_str()
         );
@@ -143,19 +141,23 @@ impl PostgresStorage {
                     &cell_type,
                     &format,
                     &cell.content,
-                    &cell.valid_from,
-                    &cell.valid_to,
-                    &children,
+                    &format_db_time(&cell.valid_from),
+                    &format_db_time(&cell.valid_to),
+                    &cell.fabric_id.map(|value| value.to_string()),
                 ],
             )?;
 
-            if matches!(cell.cell_type, CellType::Container) {
+            if cell.fabric_id.is_some() {
                 client.execute(
                     "INSERT INTO fabric_cell (id, valid_from, valid_to)
                      VALUES ($1, $2, $3)
                      ON CONFLICT (id, valid_to)
                      DO UPDATE SET valid_from = EXCLUDED.valid_from",
-                    &[&cell.id.to_string(), &cell.valid_from, &cell.valid_to],
+                    &[
+                        &cell.id.to_string(),
+                        &format_db_time(&cell.valid_from),
+                        &format_db_time(&cell.valid_to),
+                    ],
                 )?;
             }
 
@@ -175,15 +177,23 @@ impl PostgresStorage {
         let cell_type_str: String = row.get(1);
         let format_str: String = row.get(2);
         let content: Vec<u8> = row.get(3);
-        let valid_from: i64 = row.get(4);
-        let valid_to: i64 = row.get(5);
-        let children_str: String = row.get(6);
+        let valid_from_str: String = row.get(4);
+        let valid_to_str: String = row.get(5);
+        let fabric_id_str: Option<String> = row.get(6);
 
         let id = Uuid::parse_str(&id_str)
             .map_err(|err| EngineError::InvalidData(format!("invalid UUID in row: {err}")))?;
         let cell_type = serde_json::from_str(&cell_type_str)?;
         let format = serde_json::from_str(&format_str)?;
-        let children = serde_json::from_str(&children_str)?;
+        let fabric_id = fabric_id_str
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(|err| {
+                EngineError::InvalidData(format!("invalid fabric UUID in cell row: {err}"))
+            })?;
+
+        let valid_from = parse_db_time(&valid_from_str)?;
+        let valid_to = parse_db_time(&valid_to_str)?;
 
         Ok(Cell {
             id,
@@ -192,13 +202,24 @@ impl PostgresStorage {
             content,
             valid_from,
             valid_to,
-            children,
+            fabric_id,
         })
     }
 
-    fn get_cell_at_from_table(&self, table: CellTable, id: Uuid, ts: i64) -> Result<Option<Cell>> {
+    fn get_cell_at_from_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+        ts: Timestamp,
+    ) -> Result<Option<Cell>> {
         let sql = format!(
-            "SELECT id, cell_type, format, content, valid_from, valid_to, children
+            "SELECT id,
+                    cell_type,
+                    format,
+                    content,
+                    to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US') as valid_from,
+                    to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US') as valid_to,
+                    fabric_id
              FROM {}
              WHERE id = $1 AND valid_from <= $2 AND valid_to > $2
              ORDER BY valid_from DESC
@@ -208,30 +229,35 @@ impl PostgresStorage {
 
         self.with_client(|client| {
             let id_str = id.to_string();
-            let row = client.query_opt(&sql, &[&id_str, &ts])?;
+            let row = client.query_opt(&sql, &[&id_str, &format_db_time(&ts)])?;
             row.map(|r| Self::cell_from_row(&r)).transpose()
         })
     }
 
-    fn latest_materialized_ts_from_table(&self, table: CellTable, id: Uuid) -> Result<Option<i64>> {
+    fn latest_materialized_ts_from_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+    ) -> Result<Option<Timestamp>> {
         let sql = format!(
             "WITH timeline AS (
                 SELECT MAX(valid_from) AS ts FROM {table} WHERE id = $1
                 UNION ALL
                 SELECT MAX(valid_to) AS ts FROM {table} WHERE id = $1 AND valid_to < $2
             )
-            SELECT MAX(ts) FROM timeline",
+            SELECT to_char(MAX(ts), 'YYYY-MM-DD HH24:MI:SS.US') FROM timeline",
             table = table.as_str()
         );
 
         self.with_client(|client| {
             let id_str = id.to_string();
-            let row = client.query_one(&sql, &[&id_str, &POSTGRES_OPEN_ENDED_VALID_TO])?;
-            Ok(row.get(0))
+            let row = client.query_one(&sql, &[&id_str, &FUTURE_SENTINEL_STR])?;
+            let value: Option<String> = row.get(0);
+            value.map(|ts| parse_db_time(&ts)).transpose()
         })
     }
 
-    fn active_table_for_id(&self, id: Uuid, ts: i64) -> Result<Option<CellTable>> {
+    fn active_table_for_id(&self, id: Uuid, ts: Timestamp) -> Result<Option<CellTable>> {
         if self
             .get_cell_at_from_table(CellTable::Data, id, ts)?
             .is_some()
@@ -251,25 +277,30 @@ impl PostgresStorage {
 }
 
 impl Storage for PostgresStorage {
-    fn current_timestamp(&self) -> Result<i64> {
+    fn current_query_timestamp(&self) -> Result<Timestamp> {
         self.with_client(|client| {
             let row = client.query_one(
-                "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
+                "SELECT to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.US')",
                 &[],
             )?;
-            Ok(row.get(0))
+            let value: String = row.get(0);
+            parse_db_time(&value)
         })
     }
 
-    fn open_ended_valid_to(&self) -> i64 {
-        POSTGRES_OPEN_ENDED_VALID_TO
+    fn active_valid_to_sentinel(&self) -> Timestamp {
+        future_sentinel()
     }
 
     fn insert_cell(&self, cell: &Cell) -> Result<()> {
         self.insert_cell_in_table(Self::table_for_cell_type(&cell.cell_type), cell)
     }
 
-    fn reserve_update_timestamp(&self, id: Uuid, candidate_ts: i64) -> Result<i64> {
+    fn reserve_next_version_timestamp(
+        &self,
+        id: Uuid,
+        candidate_ts: Timestamp,
+    ) -> Result<Timestamp> {
         let data_latest = self.latest_materialized_ts_from_table(CellTable::Data, id)?;
         let meta_latest = self.latest_materialized_ts_from_table(CellTable::Meta, id)?;
         let latest = match (data_latest, meta_latest) {
@@ -280,14 +311,14 @@ impl Storage for PostgresStorage {
         };
 
         let next = match latest {
-            Some(prev) if candidate_ts <= prev => prev.saturating_add(1),
+            Some(prev) if candidate_ts <= prev => prev + chrono::Duration::microseconds(1),
             _ => candidate_ts,
         };
 
         Ok(next)
     }
 
-    fn get_cell_at(&self, id: Uuid, ts: i64) -> Result<Cell> {
+    fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
         if let Some(cell) = self.get_cell_at_from_table(CellTable::Data, id, ts)? {
             return Ok(cell);
         }
@@ -299,7 +330,7 @@ impl Storage for PostgresStorage {
         Err(EngineError::NotFound)
     }
 
-    fn close_active_version(&self, id: Uuid, now_ts: i64) -> Result<()> {
+    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()> {
         let Some(table) = self.active_table_for_id(id, now_ts)? else {
             return Err(EngineError::NotFound);
         };
@@ -313,7 +344,7 @@ impl Storage for PostgresStorage {
 
         self.with_client(|client| {
             let id_str = id.to_string();
-            let changed = client.execute(&sql, &[&id_str, &now_ts])?;
+            let changed = client.execute(&sql, &[&id_str, &format_db_time(&now_ts)])?;
             if changed == 0 {
                 return Err(EngineError::NotFound);
             }
@@ -322,63 +353,63 @@ impl Storage for PostgresStorage {
                 "UPDATE fabric_cell
                  SET valid_to = $2
                  WHERE id = $1 AND valid_from <= $2 AND valid_to > $2",
-                &[&id_str, &now_ts],
+                &[&id_str, &format_db_time(&now_ts)],
             )?;
 
             Ok(())
         })
     }
 
-    fn insert_edge(&self, edge: &FabricEdge, now_ts: i64) -> Result<()> {
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()> {
         self.with_client(|client| {
-            let parent_id = edge.parent_id.to_string();
-            let child_id = edge.child_id.to_string();
-            let relation_type = serde_json::to_string(&edge.relation_type)?;
+            let fabric_id = fabric_cell.fabric_id.to_string();
+            let cell_id = fabric_cell.cell_id.to_string();
+            let relation_type = serde_json::to_string(&fabric_cell.relation_type)?;
+            let now_str = format_db_time(&now_ts);
 
-            if self.temporal_fabric_edges {
+            if self.temporal_fabric_cells {
                 client.execute(
-                    "UPDATE fabric_edge
+                    "UPDATE fabric_cells
                      SET valid_to = $4
-                     WHERE parent_id = $1
+                     WHERE fabric_id = $1
                        AND relation_type = $2
                        AND ordinal = $3
                        AND valid_from <= $4
                        AND valid_to > $4",
-                    &[&parent_id, &relation_type, &edge.ordinal, &now_ts],
+                    &[&fabric_id, &relation_type, &fabric_cell.ordinal, &now_str],
                 )?;
 
                 client.execute(
-                    "INSERT INTO fabric_edge (parent_id, child_id, relation_type, ordinal, valid_from, valid_to)
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
                      VALUES ($1, $2, $3, $4, $5, $6)",
                     &[
-                        &parent_id,
-                        &child_id,
+                        &fabric_id,
+                        &cell_id,
                         &relation_type,
-                        &edge.ordinal,
-                        &now_ts,
-                        &POSTGRES_OPEN_ENDED_VALID_TO,
+                        &fabric_cell.ordinal,
+                        &now_str,
+                        &FUTURE_SENTINEL_STR,
                     ],
                 )?;
             } else {
                 client.execute(
-                    "DELETE FROM fabric_edge
-                     WHERE parent_id = $1
+                    "DELETE FROM fabric_cells
+                     WHERE fabric_id = $1
                        AND relation_type = $2
                        AND ordinal = $3",
-                    &[&parent_id, &relation_type, &edge.ordinal],
+                    &[&fabric_id, &relation_type, &fabric_cell.ordinal],
                 )?;
 
-                let zero: i64 = 0;
                 client.execute(
-                    "INSERT INTO fabric_edge (parent_id, child_id, relation_type, ordinal, valid_from, valid_to)
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
                      VALUES ($1, $2, $3, $4, $5, $6)",
                     &[
-                        &parent_id,
-                        &child_id,
+                        &fabric_id,
+                        &cell_id,
                         &relation_type,
-                        &edge.ordinal,
-                        &zero,
-                        &POSTGRES_OPEN_ENDED_VALID_TO,
+                        &fabric_cell.ordinal,
+                        &MIN_TIMESTAMP_STR,
+                        &FUTURE_SENTINEL_STR,
                     ],
                 )?;
             }
@@ -387,86 +418,92 @@ impl Storage for PostgresStorage {
         })
     }
 
-    fn next_relation_ordinal(&self, parent_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+    fn next_relation_ordinal(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+        ts: Timestamp,
+    ) -> Result<i64> {
         self.with_client(|client| {
-            let parent = parent_id.to_string();
+            let fabric = fabric_id.to_string();
             let relation = serde_json::to_string(relation_type)?;
             let row = client.query_one(
                 "SELECT COALESCE(MAX(ordinal), -1) + 1
-                 FROM fabric_edge
-                 WHERE parent_id = $1
+                 FROM fabric_cells
+                 WHERE fabric_id = $1
                    AND relation_type = $2
-                   AND valid_to = $3",
-                &[&parent, &relation, &POSTGRES_OPEN_ENDED_VALID_TO],
+                   AND valid_from <= $3
+                   AND valid_to > $3",
+                &[&fabric, &relation, &format_db_time(&ts)],
             )?;
             Ok(row.get(0))
         })
     }
 
-    fn get_children_by_relation(
+    fn get_cells_by_relation(
         &self,
-        parent_id: Uuid,
+        fabric_id: Uuid,
         relation_type: &RelationType,
-        ts: i64,
+        ts: Timestamp,
     ) -> Result<Vec<Uuid>> {
         self.with_client(|client| {
-            let parent = parent_id.to_string();
+            let fabric = fabric_id.to_string();
             let relation = serde_json::to_string(relation_type)?;
             let rows = client.query(
-                "SELECT child_id
-                 FROM fabric_edge
-                 WHERE parent_id = $1
+                "SELECT cell_id
+                 FROM fabric_cells
+                 WHERE fabric_id = $1
                    AND relation_type = $2
                    AND valid_from <= $3
                    AND valid_to > $3
                  ORDER BY ordinal ASC",
-                &[&parent, &relation, &ts],
+                &[&fabric, &relation, &format_db_time(&ts)],
             )?;
 
             let mut result = Vec::with_capacity(rows.len());
             for row in rows {
-                let child_id_str: String = row.get(0);
-                let child_id = Uuid::parse_str(&child_id_str).map_err(|err| {
-                    EngineError::InvalidData(format!("invalid child UUID in fabric_edge: {err}"))
+                let cell_id_str: String = row.get(0);
+                let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
                 })?;
-                result.push(child_id);
+                result.push(cell_id);
             }
 
             Ok(result)
         })
     }
 
-    fn get_edges_for_parent(&self, parent_id: Uuid, ts: i64) -> Result<Vec<FabricEdge>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
         self.with_client(|client| {
-            let parent = parent_id.to_string();
+            let fabric = fabric_id.to_string();
             let rows = client.query(
-                "SELECT parent_id, child_id, relation_type, ordinal
-                 FROM fabric_edge
-                 WHERE parent_id = $1
+                "SELECT fabric_id, cell_id, relation_type, ordinal
+                 FROM fabric_cells
+                 WHERE fabric_id = $1
                    AND valid_from <= $2
                    AND valid_to > $2
                  ORDER BY relation_type ASC, ordinal ASC",
-                &[&parent, &ts],
+                &[&fabric, &format_db_time(&ts)],
             )?;
 
             let mut result = Vec::with_capacity(rows.len());
             for row in rows {
-                let parent_id_str: String = row.get(0);
-                let child_id_str: String = row.get(1);
+                let fabric_id_str: String = row.get(0);
+                let cell_id_str: String = row.get(1);
                 let relation_type_str: String = row.get(2);
                 let ordinal: i64 = row.get(3);
 
-                let parent_id = Uuid::parse_str(&parent_id_str).map_err(|err| {
-                    EngineError::InvalidData(format!("invalid parent UUID in fabric_edge: {err}"))
+                let fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid fabric UUID in fabric_cells: {err}"))
                 })?;
-                let child_id = Uuid::parse_str(&child_id_str).map_err(|err| {
-                    EngineError::InvalidData(format!("invalid child UUID in fabric_edge: {err}"))
+                let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
                 })?;
                 let relation_type = serde_json::from_str(&relation_type_str)?;
 
-                result.push(FabricEdge {
-                    parent_id,
-                    child_id,
+                result.push(FabricCell {
+                    fabric_id,
+                    cell_id,
                     relation_type,
                     ordinal,
                 });

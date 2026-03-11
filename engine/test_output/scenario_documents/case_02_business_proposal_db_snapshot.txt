@@ -2,8 +2,8 @@ Scenario Snapshot
 case_id=case_02
 document_type=business_proposal
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019caed6-df83-7bc1-b9e6-5bc1ccabedca
-purpose_id=019caed6-df84-7261-b629-07d7beb58af0
+root_id=019cdd4a-ee38-7863-b4c5-d215cebaf745
+purpose_id=019cdd4a-ee39-7243-bb86-bdd7b9ca86ad
 section_count=5
 reference_count=50
 tag_count=7

@@ -55,14 +55,14 @@ impl DocumentKind {
 
 #[derive(Debug, Clone)]
 pub struct Document {
-    pub id: Uuid,
+    pub root_cell_id: Uuid,
     pub kind: DocumentKind,
 }
 
 impl Document {
     pub fn from_cell(cell: &Cell) -> Option<Self> {
         Some(Self {
-            id: cell.id,
+            root_cell_id: cell.id,
             kind: DocumentKind::parse(&cell.cell_type)?,
         })
     }

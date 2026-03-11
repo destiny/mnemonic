@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod document;
-pub mod engine;
-pub mod error;
-pub mod models;
-pub mod service;
-pub mod storage;
+use serde::{Deserialize, Serialize};
 
-pub use document::{Document, DocumentKind};
-pub use engine::{DocumentContext, Engine, EngineConfig};
-pub use error::{EngineError, Result};
-pub use models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricCell, FabricContext, RelationType,
-    Timestamp, VersionCandidate,
-};
-pub use service::context::ServiceContext;
-pub use service::{DictionaryEntryInput, Service, ServiceApi};
-pub use storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};
+use crate::models::Timestamp;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConflictStrategy {
+    LastWriteWins,
+    LogicalClock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionCandidate {
+    pub content: Vec<u8>,
+    pub timestamp: Timestamp,
+    pub logical_clock: Option<u64>,
+}

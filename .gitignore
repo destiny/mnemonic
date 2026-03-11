@@ -1,3 +1,7 @@
 .DS_Store
 target/
 **/target/
+.output.txt
+error.log
+mnemonic.sqlite
+engine/test_output/

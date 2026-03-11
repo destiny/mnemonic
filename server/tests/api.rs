@@ -3,8 +3,8 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use mnemonic_engine::{CellType, ContentFormat, Document, Engine};
-use mnemonic_server::{AppContext, router};
+use mnemonic_engine::{CellType, ContentFormat, Engine};
+use mnemonic_server::{AppContext, DocumentResponse, router};
 use tower::util::ServiceExt;
 
 fn test_app() -> axum::Router {
@@ -61,16 +61,17 @@ async fn create_get_update_and_history_document() {
         .await
         .unwrap()
         .to_bytes();
-    let created: Document = serde_json::from_slice(&created_bytes).unwrap();
-    assert_eq!(created.cell_type, CellType::Data);
-    assert_eq!(created.format, ContentFormat::Markdown);
+    let created: DocumentResponse = serde_json::from_slice(&created_bytes).unwrap();
+    assert_eq!(created.root.cell_type, CellType::Data);
+    assert_eq!(created.root.format, ContentFormat::Markdown);
+    assert_eq!(created.root_cell_id, created.root.id);
 
     let get_response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/documents/{}", created.id))
+                .uri(format!("/documents/{}", created.root_cell_id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -79,10 +80,10 @@ async fn create_get_update_and_history_document() {
 
     assert_eq!(get_response.status(), StatusCode::OK);
     let get_bytes = get_response.into_body().collect().await.unwrap().to_bytes();
-    let current: Document = serde_json::from_slice(&get_bytes).unwrap();
-    assert_eq!(current.content, b"# Draft".to_vec());
+    let current: DocumentResponse = serde_json::from_slice(&get_bytes).unwrap();
+    assert_eq!(current.root.content, b"# Draft".to_vec());
 
-    let history_ts = current.valid_from;
+    let history_ts = current.root.valid_from.to_rfc3339();
 
     let update_payload = r##"{"content":"# Draft v2"}"##;
     let update_response = app
@@ -90,7 +91,7 @@ async fn create_get_update_and_history_document() {
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
-                .uri(format!("/documents/{}", created.id))
+                .uri(format!("/documents/{}", created.root_cell_id))
                 .header("content-type", "application/json")
                 .body(Body::from(update_payload))
                 .unwrap(),
@@ -106,7 +107,7 @@ async fn create_get_update_and_history_document() {
                 .method(Method::GET)
                 .uri(format!(
                     "/documents/{}/history?timestamp={}",
-                    created.id, history_ts
+                    created.root_cell_id, history_ts
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -121,6 +122,6 @@ async fn create_get_update_and_history_document() {
         .await
         .unwrap()
         .to_bytes();
-    let historic: Document = serde_json::from_slice(&history_bytes).unwrap();
-    assert_eq!(historic.content, b"# Draft".to_vec());
+    let historic: DocumentResponse = serde_json::from_slice(&history_bytes).unwrap();
+    assert_eq!(historic.root.content, b"# Draft".to_vec());
 }

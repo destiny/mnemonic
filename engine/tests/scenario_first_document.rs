@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use chrono::Utc;
 
-use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType};
+use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType, Timestamp};
+use mnemonic_engine::storage::time::format_db_time;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
@@ -57,11 +58,8 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
+fn now_ts() -> Timestamp {
+    Utc::now()
 }
 
 fn scenario_output_dir() -> PathBuf {
@@ -798,7 +796,7 @@ fn store_scenario_into_engine(
         )
         .unwrap();
     engine
-        .add_relation(root.id, purpose.id, RelationType::Contains, Some(0))
+        .add_fabric_cell(root.id, purpose.id, RelationType::Contains, Some(0))
         .unwrap();
 
     let mut section_ids = Vec::new();
@@ -811,7 +809,7 @@ fn store_scenario_into_engine(
             )
             .unwrap();
         engine
-            .add_relation(
+            .add_fabric_cell(
                 root.id,
                 section_cell.id,
                 RelationType::Contains,
@@ -831,7 +829,7 @@ fn store_scenario_into_engine(
             )
             .unwrap();
         engine
-            .add_relation(
+            .add_fabric_cell(
                 root.id,
                 reference_cell.id,
                 RelationType::References,
@@ -848,7 +846,7 @@ fn store_scenario_into_engine(
             .create_cell(CellType::Tag, ContentFormat::Text, tag_payload.into_bytes())
             .unwrap();
         engine
-            .add_relation(
+            .add_fabric_cell(
                 root.id,
                 tag_cell.id,
                 RelationType::Custom(TAGGED_AS_RELATION.to_string()),
@@ -878,7 +876,11 @@ fn get_active_content(conn: &Connection, id: Uuid) -> String {
         LIMIT 1
     ";
     let bytes: Vec<u8> = conn
-        .query_row(sql, params![id.to_string(), now], |row| row.get(0))
+        .query_row(
+            sql,
+            params![id.to_string(), format_db_time(&now)],
+            |row| row.get(0),
+        )
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -891,9 +893,9 @@ fn query_children_by_relation(
     let now = now_ts();
     let mut stmt = conn
         .prepare(
-            "SELECT child_id
-             FROM fabric_edge
-             WHERE parent_id = ?1
+            "SELECT cell_id
+             FROM fabric_cells
+             WHERE fabric_id = ?1
                AND relation_type = ?2
                AND valid_from <= ?3
                AND valid_to > ?3
@@ -901,10 +903,13 @@ fn query_children_by_relation(
         )
         .unwrap();
     let relation_json = relation_type_json(relation);
-    stmt.query_map(params![root_id.to_string(), relation_json, now], |row| {
-        let child_id: String = row.get(0)?;
-        Ok(Uuid::parse_str(&child_id).unwrap())
-    })
+    stmt.query_map(
+        params![root_id.to_string(), relation_json, format_db_time(&now)],
+        |row| {
+        let cell_id: String = row.get(0)?;
+        Ok(Uuid::parse_str(&cell_id).unwrap())
+    },
+    )
     .unwrap()
     .map(|row| row.unwrap())
     .collect::<Vec<_>>()
@@ -978,21 +983,21 @@ fn write_db_snapshot(
     let active_data_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM data_cell WHERE valid_from <= ?1 AND valid_to > ?1",
-            params![now],
+            params![format_db_time(&now)],
             |row| row.get(0),
         )
         .unwrap();
     let active_meta_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM meta_cell WHERE valid_from <= ?1 AND valid_to > ?1",
-            params![now],
+            params![format_db_time(&now)],
             |row| row.get(0),
         )
         .unwrap();
     let active_edge_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM fabric_edge WHERE valid_from <= ?1 AND valid_to > ?1",
-            params![now],
+            "SELECT COUNT(*) FROM fabric_cells WHERE valid_from <= ?1 AND valid_to > ?1",
+            params![format_db_time(&now)],
             |row| row.get(0),
         )
         .unwrap();

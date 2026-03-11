@@ -2,8 +2,8 @@ Scenario Snapshot
 case_id=case_06
 document_type=drama_script
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019caed6-e224-7a50-a926-c827a554d580
-purpose_id=019caed6-e226-76f2-ae31-7f93e42108eb
+root_id=019cdd4a-effe-7502-aadc-05964f6b9383
+purpose_id=019cdd4a-f000-71f1-a6ef-a8cb81f9c915
 section_count=6
 reference_count=20
 tag_count=6

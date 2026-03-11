@@ -12,20 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod document;
-pub mod engine;
-pub mod error;
-pub mod models;
-pub mod service;
-pub mod storage;
+pub mod cell;
+pub mod fabric;
+pub mod version;
 
-pub use document::{Document, DocumentKind};
-pub use engine::{DocumentContext, Engine, EngineConfig};
-pub use error::{EngineError, Result};
-pub use models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricCell, FabricContext, RelationType,
-    Timestamp, VersionCandidate,
-};
-pub use service::context::ServiceContext;
-pub use service::{DictionaryEntryInput, Service, ServiceApi};
-pub use storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};
+pub use cell::{Cell, CellType, ContentFormat, Timestamp};
+pub use fabric::{FabricCell, FabricContext, RelationType};
+pub use version::{ConflictStrategy, VersionCandidate};
