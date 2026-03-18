@@ -15,7 +15,7 @@
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::models::{Cell, FabricCell, RelationType, Timestamp};
+use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
 
 pub mod mariadb;
 pub mod mysql;
@@ -29,37 +29,45 @@ pub use postgres::PostgresStorage;
 pub use sqlite::SqliteStorage;
 
 pub trait Storage: Send + Sync {
-    fn current_query_timestamp(&self) -> Result<Timestamp>;
-
-    fn active_valid_to_sentinel(&self) -> Timestamp;
-
-    fn insert_cell(&self, cell: &Cell) -> Result<()>;
-
-    fn reserve_next_version_timestamp(
+    fn insert_cell(
         &self,
         id: Uuid,
-        candidate_ts: Timestamp,
-    ) -> Result<Timestamp>;
-
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell>;
+    fn replace_cell(
+        &self,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell>;
+    fn delete_cell(&self, id: Uuid) -> Result<()>;
+    fn get_cell(&self, id: Uuid) -> Result<Cell>;
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell>;
-
-    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()>;
-
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()>;
-
-    fn next_relation_ordinal(
+    fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>>;
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()>;
+    fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64>;
+    fn next_relation_ordinal_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
         ts: Timestamp,
     ) -> Result<i64>;
-
     fn get_cells_by_relation(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+    ) -> Result<Vec<Uuid>>;
+    fn get_cells_by_relation_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
         ts: Timestamp,
     ) -> Result<Vec<Uuid>>;
-
-    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>>;
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>>;
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>>;
 }

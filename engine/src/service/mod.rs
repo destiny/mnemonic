@@ -22,7 +22,11 @@ pub struct DictionaryEntryInput {
 
 pub trait ServiceApi {
     fn create_document_context(&self, kind: DocumentKind) -> Result<ServiceContext>;
-    fn open_context(&self, document_id: Uuid, timestamp: Option<Timestamp>) -> Result<ServiceContext>;
+    fn open_context(
+        &self,
+        document_id: Uuid,
+        timestamp: Option<Timestamp>,
+    ) -> Result<ServiceContext>;
     fn detect_kind(&self, document_id: Uuid) -> Result<DocumentKind>;
 }
 
@@ -89,7 +93,7 @@ impl<'a> Service<'a> {
     ) -> Result<Uuid> {
         self.ensure_kind(context, DocumentKind::Dictionary)?;
 
-        let key_cell = self.engine.create_cell(
+        let key_cell = self.engine.create_cell_with_fabric(
             CellType::Keyword,
             ContentFormat::Text,
             entry.key.as_bytes().to_vec(),
@@ -127,13 +131,13 @@ impl<'a> Service<'a> {
             .get_cells_by_relation(context.document.root_cell_id, dictionary::key_relation())?;
 
         for key_id in key_ids {
-            let key = self.engine.get_current(key_id)?;
+            let key = self.engine.get_cell(key_id)?;
             let values = self
                 .engine
                 .get_cells_by_relation(key_id, dictionary::value_relation())?;
 
             for value_id in values {
-                let value = self.engine.get_current(value_id)?;
+                let value = self.engine.get_cell(value_id)?;
                 let line = format!(
                     "{}: {}",
                     String::from_utf8_lossy(&key.content),
@@ -172,9 +176,11 @@ impl<'a> Service<'a> {
 
 impl ServiceApi for Service<'_> {
     fn create_document_context(&self, kind: DocumentKind) -> Result<ServiceContext> {
-        let root = self
-            .engine
-            .create_cell(kind.as_cell_type(), ContentFormat::Json, vec![])?;
+        let root = self.engine.create_cell_with_fabric(
+            kind.as_cell_type(),
+            ContentFormat::Json,
+            vec![],
+        )?;
         let document = Document::from_cell(&root).ok_or_else(|| {
             EngineError::InvalidData("root does not use a document.<kind> cell type".to_string())
         })?;
@@ -182,8 +188,15 @@ impl ServiceApi for Service<'_> {
         Ok(ServiceContext::new(document, None))
     }
 
-    fn open_context(&self, document_id: Uuid, timestamp: Option<Timestamp>) -> Result<ServiceContext> {
-        let root = self.engine.get_cell_at(document_id, timestamp)?;
+    fn open_context(
+        &self,
+        document_id: Uuid,
+        timestamp: Option<Timestamp>,
+    ) -> Result<ServiceContext> {
+        let root = match timestamp {
+            Some(timestamp) => self.engine.get_cell_at(document_id, timestamp)?,
+            None => self.engine.get_cell(document_id)?,
+        };
         let document = Document::from_cell(&root).ok_or_else(|| {
             EngineError::InvalidData(format!(
                 "document {document_id} does not use a supported document.<kind> cell_type"

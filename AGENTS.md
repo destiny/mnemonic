@@ -11,6 +11,14 @@
 
 Mnemonic Engine is a local-first, temporal, structured knowledge engine built around atomic `Cell` entities and structural `Fabric`.
 
+Canonical structure:
+
+- `Document` is the API/application root
+- A `Document` owns one root `Cell`
+- A `Cell` may reference one `Fabric`
+- A `Fabric` contains an ordered collection of `Cell`
+- The data layer stores fabric membership and ordering in `fabric_cells`
+
 Core objective:
 
 - Store small, atomic data units (`Cell`)
@@ -34,6 +42,13 @@ Core objective:
 
 A `Cell` is the atomic data unit.
 
+Canonical meaning:
+
+- A `Cell` is the smallest logical data container in the engine
+- A `Cell` may exist on its own
+- A `Cell` may optionally reference one `Fabric`
+- A `Cell` does not stop being atomic just because it owns or references structure
+
 Fields:
 
 - `id` (stable identifier)
@@ -42,7 +57,7 @@ Fields:
 - `content` (payload)
 - `valid_from`
 - `valid_to`
-- `fabric_id` (optional reference to a `Fabric` when the cell owns structured content)
+- `fabric_id` (optional reference to a `Fabric`)
 
 Versioning and keys:
 
@@ -70,16 +85,24 @@ Logical model:
 - `Fabric` contains an ordered collection of `Cell`
 - Ordering is part of the logical model
 - Storage implementation for ordering is a data-layer concern
+- A `Fabric` is not the API root and must not replace `Document` as the public usage concept
 
 Preferred logic-layer wording:
 
 - Use `Cell`, `Fabric`, and `FabricCell`
 - Do not introduce graph-specific wording such as `Edge` unless the system is explicitly being modeled as a graph engine
+- Do not rename fabric membership into `Edge`, `FabricEdge`, or other graph-oriented terms
 
 Storage model:
 
 - `fabric_cell`: fabric metadata
 - `fabric_cells`: membership and ordering of cells inside a fabric
+
+Storage guidance:
+
+- `fabric_cells` is the data-layer representation of fabric membership and order
+- Ordering may be stored with ordinal positions, linked-list style pointers, or left/right tree-style indexing
+- Storage strategy must not change the logical meaning of `Fabric` as an ordered collection of `Cell`
 
 Supported structures:
 
@@ -104,6 +127,8 @@ Canonical meaning:
 - The root `Cell` may reference a `Fabric`
 - The `Fabric` contains the ordered `Cell` collection that forms the document structure
 - `Document` is the public usage model for application and API flows
+- `Document` does not directly replace `Cell` or `Fabric`
+- `Document` must not be described as directly owning a `Fabric`; it owns a root `Cell` that may reference one
 
 Extension model:
 
@@ -115,7 +140,7 @@ Extension model:
 
 Three naming layers must remain distinct:
 
-- Engine layer: `Cell`, `Fabric`
+- Engine layer: `Cell`, `Fabric`, `FabricCell`
 - API/application layer: `Document`
 - Data layer: storage-oriented names such as `data_cell`, `meta_cell`, `fabric_cell`, `fabric_cells`
 
@@ -124,8 +149,18 @@ Rules:
 - Do not introduce extra conceptual nouns that blur the model
 - Do not use storage terminology to redefine engine concepts
 - Do not use graph terminology such as `edge` in the main logic model unless graph semantics are intentionally first-class
+- Do not use `edge`, `node`, or similar graph words to describe the `Fabric` to `Cell` relationship in the normal logic model
+- Use `FabricCell` in the engine layer and `fabric_cells` in the data layer for fabric membership representation
 - Keep storage names focused on persistence shape and efficiency
 - Keep API names focused on application usage and user-facing behavior
+
+Canonical interpretation sequence:
+
+- API/application view: `Document`
+- Engine root: root `Cell`
+- Structural view: referenced `Fabric`
+- Structural members: ordered `Cell` collection
+- Data-layer storage: `fabric_cells`
 
 ## Temporal Model
 
@@ -213,6 +248,21 @@ Guidance:
 - The logic layer should rely on validity-window semantics, not hard-code database time expressions
 - Rust may use integers or other time representations internally when needed, but that should not redefine the database temporal model
 
+Responsibility split for temporal handling:
+
+- `valid_from` / `valid_to` are part of the storage/database mechanism for temporal history
+- The engine layer should not treat timestamp mechanics as its primary concern
+- Engine concerns are:
+  - content update orchestration
+  - fabric membership and ordering behavior
+  - document context handling
+- Storage concerns are:
+  - table mapping
+  - DDL defaults for temporal columns
+  - current-state and historical-state filtering
+  - active-row closure and append-only version storage
+- The engine depends on storage-owned temporal behavior instead of owning database time expressions directly
+
 ### Tables
 
 Core tables:
@@ -241,7 +291,7 @@ Optional table:
 Implemented in Rust.
 
 - Enforce invariants
-- Manage temporal updates
+- Rely on storage-owned temporal behavior while enforcing domain invariants
 - Provide query APIs
 - Define transaction boundaries
 - Support optional sync module
@@ -293,8 +343,8 @@ Database rule:
 
 Expected engine methods:
 
-- `get_current(id)`
-- `get_at_time(id, timestamp)`
+- `get_cell(id)`
+- `get_cell_at(id, timestamp)`
 - `build_context(fabric_id)`
 - `build_context_at_time(fabric_id, timestamp)`
 

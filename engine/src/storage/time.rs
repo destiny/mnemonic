@@ -39,5 +39,5 @@ pub fn parse_db_time(value: &str) -> Result<Timestamp> {
         .map_err(|err| {
             EngineError::InvalidData(format!("invalid timestamp value '{value}': {err}"))
         })?;
-    Ok(DateTime::<Utc>::from_utc(naive, Utc))
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }

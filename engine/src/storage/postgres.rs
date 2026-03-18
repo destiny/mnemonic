@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, FabricCell, RelationType, Timestamp};
-use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time, future_sentinel};
+use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time};
 
 #[derive(Debug, Clone, Copy)]
 enum CellTable {
@@ -43,6 +43,8 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
+    const NOW_EXPR: &'static str = "clock_timestamp()";
+
     pub fn new(connection_str: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let client = Client::connect(connection_str, NoTls)?;
         let storage = Self {
@@ -124,12 +126,20 @@ impl PostgresStorage {
         })
     }
 
-    fn insert_cell_in_table(&self, table: CellTable, cell: &Cell) -> Result<()> {
-        let cell_type = serde_json::to_string(&cell.cell_type)?;
-        let format = serde_json::to_string(&cell.format)?;
+    fn insert_cell_in_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        let cell_type = serde_json::to_string(cell_type)?;
+        let format = serde_json::to_string(format)?;
         let sql = format!(
-            "INSERT INTO {} (id, cell_type, format, content, valid_from, valid_to, fabric_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO {} (id, cell_type, format, content, fabric_id)
+             VALUES ($1, $2, $3, $4, $5)",
             table.as_str()
         );
 
@@ -137,31 +147,22 @@ impl PostgresStorage {
             client.execute(
                 &sql,
                 &[
-                    &cell.id.to_string(),
+                    &id.to_string(),
                     &cell_type,
                     &format,
-                    &cell.content,
-                    &format_db_time(&cell.valid_from),
-                    &format_db_time(&cell.valid_to),
-                    &cell.fabric_id.map(|value| value.to_string()),
+                    &content,
+                    &fabric_id.map(|value| value.to_string()),
                 ],
             )?;
 
-            if cell.fabric_id.is_some() {
+            if fabric_id.is_some() {
                 client.execute(
-                    "INSERT INTO fabric_cell (id, valid_from, valid_to)
-                     VALUES ($1, $2, $3)
-                     ON CONFLICT (id, valid_to)
-                     DO UPDATE SET valid_from = EXCLUDED.valid_from",
-                    &[
-                        &cell.id.to_string(),
-                        &format_db_time(&cell.valid_from),
-                        &format_db_time(&cell.valid_to),
-                    ],
+                    "INSERT INTO fabric_cell (id) VALUES ($1)",
+                    &[&id.to_string()],
                 )?;
             }
 
-            Ok(())
+            Self::get_current_cell_from_table(client, table, id)?.ok_or(EngineError::NotFound)
         })
     }
 
@@ -234,88 +235,152 @@ impl PostgresStorage {
         })
     }
 
-    fn latest_materialized_ts_from_table(
-        &self,
+    fn get_current_cell_from_table(
+        client: &mut Client,
         table: CellTable,
         id: Uuid,
-    ) -> Result<Option<Timestamp>> {
+    ) -> Result<Option<Cell>> {
         let sql = format!(
-            "WITH timeline AS (
-                SELECT MAX(valid_from) AS ts FROM {table} WHERE id = $1
-                UNION ALL
-                SELECT MAX(valid_to) AS ts FROM {table} WHERE id = $1 AND valid_to < $2
-            )
-            SELECT to_char(MAX(ts), 'YYYY-MM-DD HH24:MI:SS.US') FROM timeline",
-            table = table.as_str()
+            "SELECT id,
+                    cell_type,
+                    format,
+                    content,
+                    to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US') as valid_from,
+                    to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US') as valid_to,
+                    fabric_id
+             FROM {}
+             WHERE id = $1 AND valid_from <= {} AND valid_to > {}
+             ORDER BY valid_from DESC
+             LIMIT 1",
+            table.as_str(),
+            Self::NOW_EXPR,
+            Self::NOW_EXPR
+        );
+
+        let row = client.query_opt(&sql, &[&id.to_string()])?;
+        row.map(|r| Self::cell_from_row(&r)).transpose()
+    }
+
+    fn get_cell_history_from_table(&self, table: CellTable, id: Uuid) -> Result<Vec<Cell>> {
+        let sql = format!(
+            "SELECT id,
+                    cell_type,
+                    format,
+                    content,
+                    to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US') as valid_from,
+                    to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US') as valid_to,
+                    fabric_id
+             FROM {}
+             WHERE id = $1
+             ORDER BY valid_from ASC, valid_to ASC",
+            table.as_str()
+        );
+        self.with_client(|client| {
+            let rows = client.query(&sql, &[&id.to_string()])?;
+            rows.into_iter()
+                .map(|row| Self::cell_from_row(&row))
+                .collect()
+        })
+    }
+
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        self.with_client(|client| {
+            if let Some(cell) = Self::get_current_cell_from_table(client, CellTable::Data, id)? {
+                return Ok(cell);
+            }
+            if let Some(cell) = Self::get_current_cell_from_table(client, CellTable::Meta, id)? {
+                return Ok(cell);
+            }
+            Err(EngineError::NotFound)
+        })
+    }
+
+    fn active_table_for_id(&self, id: Uuid) -> Result<Option<CellTable>> {
+        self.with_client(|client| {
+            if Self::get_current_cell_from_table(client, CellTable::Data, id)?.is_some() {
+                return Ok(Some(CellTable::Data));
+            }
+            if Self::get_current_cell_from_table(client, CellTable::Meta, id)?.is_some() {
+                return Ok(Some(CellTable::Meta));
+            }
+            Ok(None)
+        })
+    }
+
+    fn close_active_version(&self, id: Uuid) -> Result<()> {
+        let Some(table) = self.active_table_for_id(id)? else {
+            return Err(EngineError::NotFound);
+        };
+
+        let sql = format!(
+            "UPDATE {}
+             SET valid_to = {}
+             WHERE id = $1 AND valid_from <= {} AND valid_to > {}",
+            table.as_str(),
+            Self::NOW_EXPR,
+            Self::NOW_EXPR,
+            Self::NOW_EXPR
         );
 
         self.with_client(|client| {
             let id_str = id.to_string();
-            let row = client.query_one(&sql, &[&id_str, &FUTURE_SENTINEL_STR])?;
-            let value: Option<String> = row.get(0);
-            value.map(|ts| parse_db_time(&ts)).transpose()
+            let changed = client.execute(&sql, &[&id_str])?;
+            if changed == 0 {
+                return Err(EngineError::NotFound);
+            }
+            client.execute(
+                &format!(
+                    "UPDATE fabric_cell
+                     SET valid_to = {}
+                     WHERE id = $1 AND valid_from <= {} AND valid_to > {}",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&id_str],
+            )?;
+            Ok(())
         })
-    }
-
-    fn active_table_for_id(&self, id: Uuid, ts: Timestamp) -> Result<Option<CellTable>> {
-        if self
-            .get_cell_at_from_table(CellTable::Data, id, ts)?
-            .is_some()
-        {
-            return Ok(Some(CellTable::Data));
-        }
-
-        if self
-            .get_cell_at_from_table(CellTable::Meta, id, ts)?
-            .is_some()
-        {
-            return Ok(Some(CellTable::Meta));
-        }
-
-        Ok(None)
     }
 }
 
 impl Storage for PostgresStorage {
-    fn current_query_timestamp(&self) -> Result<Timestamp> {
-        self.with_client(|client| {
-            let row = client.query_one(
-                "SELECT to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.US')",
-                &[],
-            )?;
-            let value: String = row.get(0);
-            parse_db_time(&value)
-        })
-    }
-
-    fn active_valid_to_sentinel(&self) -> Timestamp {
-        future_sentinel()
-    }
-
-    fn insert_cell(&self, cell: &Cell) -> Result<()> {
-        self.insert_cell_in_table(Self::table_for_cell_type(&cell.cell_type), cell)
-    }
-
-    fn reserve_next_version_timestamp(
+    fn insert_cell(
         &self,
         id: Uuid,
-        candidate_ts: Timestamp,
-    ) -> Result<Timestamp> {
-        let data_latest = self.latest_materialized_ts_from_table(CellTable::Data, id)?;
-        let meta_latest = self.latest_materialized_ts_from_table(CellTable::Meta, id)?;
-        let latest = match (data_latest, meta_latest) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.insert_cell_in_table(
+            Self::table_for_cell_type(cell_type),
+            id,
+            cell_type,
+            format,
+            content,
+            fabric_id,
+        )
+    }
 
-        let next = match latest {
-            Some(prev) if candidate_ts <= prev => prev + chrono::Duration::microseconds(1),
-            _ => candidate_ts,
-        };
+    fn replace_cell(
+        &self,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.close_active_version(id)?;
+        self.insert_cell(id, cell_type, format, content, fabric_id)
+    }
 
-        Ok(next)
+    fn delete_cell(&self, id: Uuid) -> Result<()> {
+        self.close_active_version(id)
+    }
+
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        PostgresStorage::get_cell(self, id)
     }
 
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
@@ -330,66 +395,44 @@ impl Storage for PostgresStorage {
         Err(EngineError::NotFound)
     }
 
-    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()> {
-        let Some(table) = self.active_table_for_id(id, now_ts)? else {
-            return Err(EngineError::NotFound);
-        };
-
-        let sql = format!(
-            "UPDATE {}
-             SET valid_to = $2
-             WHERE id = $1 AND valid_from <= $2 AND valid_to > $2",
-            table.as_str()
-        );
-
-        self.with_client(|client| {
-            let id_str = id.to_string();
-            let changed = client.execute(&sql, &[&id_str, &format_db_time(&now_ts)])?;
-            if changed == 0 {
-                return Err(EngineError::NotFound);
-            }
-
-            client.execute(
-                "UPDATE fabric_cell
-                 SET valid_to = $2
-                 WHERE id = $1 AND valid_from <= $2 AND valid_to > $2",
-                &[&id_str, &format_db_time(&now_ts)],
-            )?;
-
-            Ok(())
-        })
+    fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
+        let mut rows = self.get_cell_history_from_table(CellTable::Data, id)?;
+        rows.extend(self.get_cell_history_from_table(CellTable::Meta, id)?);
+        rows.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then(a.valid_to.cmp(&b.valid_to))
+        });
+        Ok(rows)
     }
 
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()> {
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
         self.with_client(|client| {
             let fabric_id = fabric_cell.fabric_id.to_string();
             let cell_id = fabric_cell.cell_id.to_string();
             let relation_type = serde_json::to_string(&fabric_cell.relation_type)?;
-            let now_str = format_db_time(&now_ts);
 
             if self.temporal_fabric_cells {
                 client.execute(
-                    "UPDATE fabric_cells
-                     SET valid_to = $4
+                    &format!(
+                        "UPDATE fabric_cells
+                     SET valid_to = {}
                      WHERE fabric_id = $1
                        AND relation_type = $2
                        AND ordinal = $3
-                       AND valid_from <= $4
-                       AND valid_to > $4",
-                    &[&fabric_id, &relation_type, &fabric_cell.ordinal, &now_str],
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                        Self::NOW_EXPR,
+                        Self::NOW_EXPR,
+                        Self::NOW_EXPR
+                    ),
+                    &[&fabric_id, &relation_type, &fabric_cell.ordinal],
                 )?;
 
                 client.execute(
-                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                    &[
-                        &fabric_id,
-                        &cell_id,
-                        &relation_type,
-                        &fabric_cell.ordinal,
-                        &now_str,
-                        &FUTURE_SENTINEL_STR,
-                    ],
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal)
+                     VALUES ($1, $2, $3, $4)",
+                    &[&fabric_id, &cell_id, &relation_type, &fabric_cell.ordinal],
                 )?;
             } else {
                 client.execute(
@@ -418,7 +461,28 @@ impl Storage for PostgresStorage {
         })
     }
 
-    fn next_relation_ordinal(
+    fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+        self.with_client(|client| {
+            let fabric = fabric_id.to_string();
+            let relation = serde_json::to_string(relation_type)?;
+            let row = client.query_one(
+                &format!(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1
+                     FROM fabric_cells
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&fabric, &relation],
+            )?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn next_relation_ordinal_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -441,6 +505,41 @@ impl Storage for PostgresStorage {
     }
 
     fn get_cells_by_relation(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+    ) -> Result<Vec<Uuid>> {
+        self.with_client(|client| {
+            let fabric = fabric_id.to_string();
+            let relation = serde_json::to_string(relation_type)?;
+            let rows = client.query(
+                &format!(
+                    "SELECT cell_id
+                     FROM fabric_cells
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND valid_from <= {}
+                       AND valid_to > {}
+                     ORDER BY ordinal ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&fabric, &relation],
+            )?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for row in rows {
+                let cell_id_str: String = row.get(0);
+                let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
+                })?;
+                result.push(cell_id);
+            }
+            Ok(result)
+        })
+    }
+
+    fn get_cells_by_relation_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -473,7 +572,48 @@ impl Storage for PostgresStorage {
         })
     }
 
-    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
+        self.with_client(|client| {
+            let fabric = fabric_id.to_string();
+            let rows = client.query(
+                &format!(
+                    "SELECT fabric_id, cell_id, relation_type, ordinal
+                     FROM fabric_cells
+                     WHERE fabric_id = $1
+                       AND valid_from <= {}
+                       AND valid_to > {}
+                     ORDER BY relation_type ASC, ordinal ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&fabric],
+            )?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for row in rows {
+                let fabric_id_str: String = row.get(0);
+                let cell_id_str: String = row.get(1);
+                let relation_type_str: String = row.get(2);
+                let ordinal: i64 = row.get(3);
+                let fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid fabric UUID in fabric_cells: {err}"))
+                })?;
+                let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
+                })?;
+                let relation_type = serde_json::from_str(&relation_type_str)?;
+                result.push(FabricCell {
+                    fabric_id,
+                    cell_id,
+                    relation_type,
+                    ordinal,
+                });
+            }
+            Ok(result)
+        })
+    }
+
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
         self.with_client(|client| {
             let fabric = fabric_id.to_string();
             let rows = client.query(
