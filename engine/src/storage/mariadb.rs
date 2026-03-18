@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, FabricCell, RelationType, Timestamp};
-use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time, future_sentinel};
+use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time};
 
 #[derive(Debug, Clone, Copy)]
 enum CellTable {
@@ -43,6 +43,8 @@ pub struct MariaDbStorage {
 }
 
 impl MariaDbStorage {
+    const NOW_EXPR: &'static str = "CURRENT_TIMESTAMP(6)";
+
     pub fn new(connection_str: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let opts = Opts::from_url(connection_str)
             .map_err(|err| EngineError::InvalidData(format!("invalid MariaDB URL: {err}")))?;
@@ -178,43 +180,45 @@ impl MariaDbStorage {
         }
     }
 
-    fn insert_cell_in_table(&self, table: CellTable, cell: &Cell) -> Result<()> {
-        let cell_type = serde_json::to_string(&cell.cell_type)?;
-        let format = serde_json::to_string(&cell.format)?;
+    fn insert_cell_in_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        let cell_type = serde_json::to_string(cell_type)?;
+        let format = serde_json::to_string(format)?;
 
         self.with_conn(|conn| {
             let sql = format!(
-                "INSERT INTO {} (id, cell_type, format, content, valid_from, valid_to, fabric_id)
-                 VALUES (:id, :cell_type, :format, :content, :valid_from, :valid_to, :fabric_id)",
+                "INSERT INTO {} (id, cell_type, format, content, fabric_id)
+                 VALUES (:id, :cell_type, :format, :content, :fabric_id)",
                 table.as_str()
             );
             conn.exec_drop(
                 sql,
                 params! {
-                    "id" => cell.id.to_string(),
+                    "id" => id.to_string(),
                     "cell_type" => cell_type,
                     "format" => format,
-                    "content" => cell.content.clone(),
-                    "valid_from" => format_db_time(&cell.valid_from),
-                    "valid_to" => format_db_time(&cell.valid_to),
-                    "fabric_id" => cell.fabric_id.map(|value| value.to_string()),
+                    "content" => content.to_vec(),
+                    "fabric_id" => fabric_id.map(|value| value.to_string()),
                 },
             )?;
 
-            if cell.fabric_id.is_some() {
+            if fabric_id.is_some() {
                 conn.exec_drop(
-                    "INSERT INTO fabric_cell (id, valid_from, valid_to)
-                     VALUES (:id, :valid_from, :valid_to)
-                     ON DUPLICATE KEY UPDATE valid_from = VALUES(valid_from)",
+                    "INSERT INTO fabric_cell (id) VALUES (:id)",
                     params! {
-                        "id" => cell.id.to_string(),
-                        "valid_from" => format_db_time(&cell.valid_from),
-                        "valid_to" => format_db_time(&cell.valid_to),
+                        "id" => id.to_string(),
                     },
                 )?;
             }
 
-            Ok(())
+            self.get_cell(id)
         })
     }
 
@@ -227,8 +231,15 @@ impl MariaDbStorage {
             valid_from_str,
             valid_to_str,
             fabric_id_str,
-        ): (String, String, String, Vec<u8>, String, String, Option<String>) =
-            mysql::from_row_opt(row)
+        ): (
+            String,
+            String,
+            String,
+            Vec<u8>,
+            String,
+            String,
+            Option<String>,
+        ) = mysql::from_row_opt(row)
             .map_err(|err| EngineError::InvalidData(format!("invalid cell row shape: {err}")))?;
 
         let id = Uuid::parse_str(&id_str)
@@ -290,93 +301,149 @@ impl MariaDbStorage {
         })
     }
 
-    fn latest_materialized_ts_from_table(
-        &self,
-        table: CellTable,
-        id: Uuid,
-    ) -> Result<Option<Timestamp>> {
+    fn get_current_cell_from_table(&self, table: CellTable, id: Uuid) -> Result<Option<Cell>> {
         let sql = format!(
-            "WITH timeline AS (
-                SELECT MAX(valid_from) AS ts FROM {table} WHERE id = :id
-                UNION ALL
-                SELECT MAX(valid_to) AS ts FROM {table} WHERE id = :id AND valid_to < :max_time
-            )
-            SELECT DATE_FORMAT(MAX(ts), '%Y-%m-%d %H:%i:%s.%f') AS latest_ts FROM timeline",
-            table = table.as_str()
+            "SELECT id,
+                    cell_type,
+                    format,
+                    content,
+                    DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s.%f') AS valid_from,
+                    DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s.%f') AS valid_to,
+                    fabric_id
+             FROM {}
+             WHERE id = :id AND valid_from <= {} AND valid_to > {}
+             ORDER BY valid_from DESC
+             LIMIT 1",
+            table.as_str(),
+            Self::NOW_EXPR,
+            Self::NOW_EXPR
         );
 
         self.with_conn(|conn| {
-            let latest: Option<String> = conn.exec_first(
-                sql,
-                params! {
-                    "id" => id.to_string(),
-                    "max_time" => FUTURE_SENTINEL_STR,
-                },
-            )?;
-            latest.map(|value| parse_db_time(&value)).transpose()
+            let row = conn.exec_first(sql, params! { "id" => id.to_string() })?;
+            row.map(Self::cell_from_row).transpose()
         })
     }
 
-    fn active_table_for_id(&self, id: Uuid, ts: Timestamp) -> Result<Option<CellTable>> {
+    fn get_cell_history_from_table(&self, table: CellTable, id: Uuid) -> Result<Vec<Cell>> {
+        let sql = format!(
+            "SELECT id,
+                    cell_type,
+                    format,
+                    content,
+                    DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s.%f') AS valid_from,
+                    DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s.%f') AS valid_to,
+                    fabric_id
+             FROM {}
+             WHERE id = :id
+             ORDER BY valid_from ASC, valid_to ASC",
+            table.as_str()
+        );
+        self.with_conn(|conn| {
+            let rows: Vec<Row> = conn.exec(sql, params! { "id" => id.to_string() })?;
+            rows.into_iter().map(Self::cell_from_row).collect()
+        })
+    }
+
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        if let Some(cell) = self.get_current_cell_from_table(CellTable::Data, id)? {
+            return Ok(cell);
+        }
+        if let Some(cell) = self.get_current_cell_from_table(CellTable::Meta, id)? {
+            return Ok(cell);
+        }
+        Err(EngineError::NotFound)
+    }
+
+    fn active_table_for_id(&self, id: Uuid) -> Result<Option<CellTable>> {
         if self
-            .get_cell_at_from_table(CellTable::Data, id, ts)?
+            .get_current_cell_from_table(CellTable::Data, id)?
             .is_some()
         {
             return Ok(Some(CellTable::Data));
         }
-
         if self
-            .get_cell_at_from_table(CellTable::Meta, id, ts)?
+            .get_current_cell_from_table(CellTable::Meta, id)?
             .is_some()
         {
             return Ok(Some(CellTable::Meta));
         }
-
         Ok(None)
+    }
+
+    fn close_active_version(&self, id: Uuid) -> Result<()> {
+        let Some(table) = self.active_table_for_id(id)? else {
+            return Err(EngineError::NotFound);
+        };
+
+        let sql = format!(
+            "UPDATE {}
+             SET valid_to = {}
+             WHERE id = :id AND valid_from <= {} AND valid_to > {}",
+            table.as_str(),
+            Self::NOW_EXPR,
+            Self::NOW_EXPR,
+            Self::NOW_EXPR
+        );
+
+        self.with_conn(|conn| {
+            conn.exec_drop(sql, params! { "id" => id.to_string() })?;
+            if conn.affected_rows() == 0 {
+                return Err(EngineError::NotFound);
+            }
+            conn.exec_drop(
+                &format!(
+                    "UPDATE fabric_cell
+                     SET valid_to = {}
+                     WHERE id = :id AND valid_from <= {} AND valid_to > {}",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                params! { "id" => id.to_string() },
+            )?;
+            Ok(())
+        })
     }
 }
 
 impl Storage for MariaDbStorage {
-    fn current_query_timestamp(&self) -> Result<Timestamp> {
-        self.with_conn(|conn| {
-            let now: Option<String> = conn.query_first(
-                "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f')",
-            )?;
-            let value = now.ok_or_else(|| {
-                EngineError::Internal("failed to read MariaDB current time".to_string())
-            })?;
-            parse_db_time(&value)
-        })
-    }
-
-    fn active_valid_to_sentinel(&self) -> Timestamp {
-        future_sentinel()
-    }
-
-    fn insert_cell(&self, cell: &Cell) -> Result<()> {
-        self.insert_cell_in_table(Self::table_for_cell_type(&cell.cell_type), cell)
-    }
-
-    fn reserve_next_version_timestamp(
+    fn insert_cell(
         &self,
         id: Uuid,
-        candidate_ts: Timestamp,
-    ) -> Result<Timestamp> {
-        let data_latest = self.latest_materialized_ts_from_table(CellTable::Data, id)?;
-        let meta_latest = self.latest_materialized_ts_from_table(CellTable::Meta, id)?;
-        let latest = match (data_latest, meta_latest) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.insert_cell_in_table(
+            Self::table_for_cell_type(cell_type),
+            id,
+            cell_type,
+            format,
+            content,
+            fabric_id,
+        )
+    }
 
-        let next = match latest {
-            Some(prev) if candidate_ts <= prev => prev + chrono::Duration::microseconds(1),
-            _ => candidate_ts,
-        };
+    fn replace_cell(
+        &self,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.close_active_version(id)?;
+        self.insert_cell(id, cell_type, format, content, fabric_id)
+    }
 
-        Ok(next)
+    fn delete_cell(&self, id: Uuid) -> Result<()> {
+        self.close_active_version(id)
+    }
+
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        MariaDbStorage::get_cell(self, id)
     }
 
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
@@ -391,77 +458,50 @@ impl Storage for MariaDbStorage {
         Err(EngineError::NotFound)
     }
 
-    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()> {
-        let Some(table) = self.active_table_for_id(id, now_ts)? else {
-            return Err(EngineError::NotFound);
-        };
-
-        let sql = format!(
-            "UPDATE {}
-             SET valid_to = :now_ts
-             WHERE id = :id AND valid_from <= :now_ts AND valid_to > :now_ts",
-            table.as_str()
-        );
-
-        self.with_conn(|conn| {
-            conn.exec_drop(
-                sql,
-                params! {
-                    "id" => id.to_string(),
-                    "now_ts" => format_db_time(&now_ts),
-                },
-            )?;
-
-            if conn.affected_rows() == 0 {
-                return Err(EngineError::NotFound);
-            }
-
-            conn.exec_drop(
-                "UPDATE fabric_cell
-                 SET valid_to = :now_ts
-                 WHERE id = :id AND valid_from <= :now_ts AND valid_to > :now_ts",
-                params! {
-                    "id" => id.to_string(),
-                    "now_ts" => format_db_time(&now_ts),
-                },
-            )?;
-
-            Ok(())
-        })
+    fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
+        let mut rows = self.get_cell_history_from_table(CellTable::Data, id)?;
+        rows.extend(self.get_cell_history_from_table(CellTable::Meta, id)?);
+        rows.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then(a.valid_to.cmp(&b.valid_to))
+        });
+        Ok(rows)
     }
 
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()> {
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
         self.with_conn(|conn| {
             let relation_type = serde_json::to_string(&fabric_cell.relation_type)?;
-            let now_str = format_db_time(&now_ts);
 
             if self.temporal_fabric_cells {
                 conn.exec_drop(
-                    "UPDATE fabric_cells
-                     SET valid_to = :now_ts
+                    &format!(
+                        "UPDATE fabric_cells
+                     SET valid_to = {}
                      WHERE fabric_id = :fabric_id
                        AND relation_type = :relation_type
                        AND ordinal = :ordinal
-                       AND valid_from <= :now_ts
-                       AND valid_to > :now_ts",
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                        Self::NOW_EXPR,
+                        Self::NOW_EXPR,
+                        Self::NOW_EXPR
+                    ),
                     params! {
                         "fabric_id" => fabric_cell.fabric_id.to_string(),
                         "relation_type" => relation_type.clone(),
                         "ordinal" => fabric_cell.ordinal,
-                        "now_ts" => now_str,
                     },
                 )?;
 
                 conn.exec_drop(
-                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
-                     VALUES (:fabric_id, :cell_id, :relation_type, :ordinal, :valid_from, :valid_to)",
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal)
+                     VALUES (:fabric_id, :cell_id, :relation_type, :ordinal)",
                     params! {
                         "fabric_id" => fabric_cell.fabric_id.to_string(),
                         "cell_id" => fabric_cell.cell_id.to_string(),
                         "relation_type" => relation_type,
                         "ordinal" => fabric_cell.ordinal,
-                        "valid_from" => now_str,
-                        "valid_to" => FUTURE_SENTINEL_STR,
                     },
                 )?;
             } else {
@@ -495,7 +535,31 @@ impl Storage for MariaDbStorage {
         })
     }
 
-    fn next_relation_ordinal(
+    fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+        self.with_conn(|conn| {
+            let relation = serde_json::to_string(relation_type)?;
+            let ordinal: Option<i64> = conn.exec_first(
+                &format!(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1
+                     FROM fabric_cells
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                params! {
+                    "fabric_id" => fabric_id.to_string(),
+                    "relation_type" => relation,
+                },
+            )?;
+
+            Ok(ordinal.unwrap_or(0))
+        })
+    }
+
+    fn next_relation_ordinal_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -522,6 +586,42 @@ impl Storage for MariaDbStorage {
     }
 
     fn get_cells_by_relation(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+    ) -> Result<Vec<Uuid>> {
+        self.with_conn(|conn| {
+            let relation = serde_json::to_string(relation_type)?;
+            let cell_ids: Vec<String> = conn.exec(
+                &format!(
+                    "SELECT cell_id
+                     FROM fabric_cells
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND valid_from <= {}
+                       AND valid_to > {}
+                     ORDER BY ordinal ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                params! {
+                    "fabric_id" => fabric_id.to_string(),
+                    "relation_type" => relation,
+                },
+            )?;
+
+            let mut result = Vec::with_capacity(cell_ids.len());
+            for cell_id_str in cell_ids {
+                let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
+                })?;
+                result.push(cell_id);
+            }
+            Ok(result)
+        })
+    }
+
+    fn get_cells_by_relation_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -556,7 +656,45 @@ impl Storage for MariaDbStorage {
         })
     }
 
-    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
+        self.with_conn(|conn| {
+            let rows: Vec<(String, String, String, i64)> = conn.exec(
+                &format!(
+                    "SELECT fabric_id, cell_id, relation_type, ordinal
+                     FROM fabric_cells
+                     WHERE fabric_id = :fabric_id
+                       AND valid_from <= {}
+                       AND valid_to > {}
+                     ORDER BY relation_type ASC, ordinal ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                params! {
+                    "fabric_id" => fabric_id.to_string(),
+                },
+            )?;
+
+            let mut result = Vec::with_capacity(rows.len());
+            for (fabric_id_str, cell_id_str, relation_type_str, ordinal) in rows {
+                let parsed_fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid fabric UUID in fabric_cells: {err}"))
+                })?;
+                let parsed_cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                    EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
+                })?;
+                let parsed_relation_type = serde_json::from_str(&relation_type_str)?;
+                result.push(FabricCell {
+                    fabric_id: parsed_fabric_id,
+                    cell_id: parsed_cell_id,
+                    relation_type: parsed_relation_type,
+                    ordinal,
+                });
+            }
+            Ok(result)
+        })
+    }
+
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
         self.with_conn(|conn| {
             let rows: Vec<(String, String, String, i64)> = conn.exec(
                 "SELECT fabric_id, cell_id, relation_type, ordinal

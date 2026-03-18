@@ -51,7 +51,7 @@ fn seed_document(engine: &Engine, seed: &DocumentSeed) -> StoredDocument {
     );
 
     let root = engine
-        .create_cell(
+        .create_cell_with_fabric(
             CellType::Container,
             ContentFormat::Json,
             root_payload.into_bytes(),

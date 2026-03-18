@@ -19,10 +19,8 @@ use uuid::Uuid;
 
 use super::Storage;
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, FabricCell, RelationType, Timestamp};
-use crate::storage::time::{
-    FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time, future_sentinel,
-};
+use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time};
 
 #[derive(Debug, Clone, Copy)]
 enum CellTable {
@@ -45,6 +43,8 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
+    const SQLITE_NOW: &'static str = "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')";
+
     pub fn new(path: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let conn = Connection::open(path)?;
         let storage = Self {
@@ -144,14 +144,18 @@ impl SqliteStorage {
         })
     }
 
-    pub fn insert_cell(&self, cell: &Cell) -> Result<()> {
-        self.insert_cell_in_table(Self::table_for_cell_type(&cell.cell_type), cell)
-    }
-
-    fn insert_cell_in_table(&self, table: CellTable, cell: &Cell) -> Result<()> {
+    fn insert_cell_in_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
         let sql = format!(
-            "INSERT INTO {} (id, cell_type, format, content, valid_from, valid_to, fabric_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO {} (id, cell_type, format, content, fabric_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             table.as_str()
         );
 
@@ -159,29 +163,22 @@ impl SqliteStorage {
             conn.execute(
                 &sql,
                 params![
-                    cell.id.to_string(),
-                    serde_json::to_string(&cell.cell_type)?,
-                    serde_json::to_string(&cell.format)?,
-                    cell.content,
-                    format_db_time(&cell.valid_from),
-                    format_db_time(&cell.valid_to),
-                    cell.fabric_id.map(|value| value.to_string()),
+                    id.to_string(),
+                    serde_json::to_string(cell_type)?,
+                    serde_json::to_string(format)?,
+                    content,
+                    fabric_id.map(|value| value.to_string()),
                 ],
             )?;
 
-            if cell.fabric_id.is_some() {
+            if fabric_id.is_some() {
                 conn.execute(
-                    "INSERT OR REPLACE INTO fabric_cell (id, valid_from, valid_to)
-                 VALUES (?1, ?2, ?3)",
-                    params![
-                        cell.id.to_string(),
-                        format_db_time(&cell.valid_from),
-                        format_db_time(&cell.valid_to),
-                    ],
+                    "INSERT INTO fabric_cell (id) VALUES (?1)",
+                    params![id.to_string()],
                 )?;
             }
 
-            Ok(())
+            Self::get_current_cell_from_table(conn, table, id)?.ok_or(EngineError::NotFound)
         })
     }
 
@@ -225,8 +222,12 @@ impl SqliteStorage {
             })
             .transpose()?;
 
-        let valid_from = parse_db_time(&valid_from_str)?;
-        let valid_to = parse_db_time(&valid_to_str)?;
+        let valid_from = parse_db_time(&valid_from_str).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?;
+        let valid_to = parse_db_time(&valid_to_str).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+        })?;
 
         Ok(Cell {
             id,
@@ -267,146 +268,218 @@ impl SqliteStorage {
         })
     }
 
-    fn latest_materialized_ts_from_table(
-        &self,
+    fn get_current_cell_from_table(
+        conn: &Connection,
         table: CellTable,
         id: Uuid,
-    ) -> Result<Option<Timestamp>> {
+    ) -> Result<Option<Cell>> {
         let sql = format!(
-            "SELECT MAX(ts) FROM (
-                SELECT MAX(valid_from) AS ts FROM {} WHERE id = ?1
-                UNION ALL
-                SELECT MAX(CASE WHEN valid_to < ?2 THEN valid_to ELSE NULL END) AS ts
-                FROM {} WHERE id = ?1
-            )",
+            "SELECT id, cell_type, format, content, valid_from, valid_to, fabric_id
+             FROM {}
+             WHERE id = ?1 AND valid_from <= {} AND valid_to > {}
+             ORDER BY valid_from DESC
+             LIMIT 1",
             table.as_str(),
+            Self::SQLITE_NOW,
+            Self::SQLITE_NOW
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let cell = stmt
+            .query_row(params![id.to_string()], Self::cell_from_row)
+            .optional()?;
+
+        Ok(cell)
+    }
+
+    fn current_db_time(conn: &Connection) -> Result<String> {
+        let now: String = conn.query_row(
+            "SELECT STRFTIME('%Y-%m-%d %H:%M:%f', 'now')",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(now)
+    }
+
+    fn get_cell_history_from_table(&self, table: CellTable, id: Uuid) -> Result<Vec<Cell>> {
+        let sql = format!(
+            "SELECT id, cell_type, format, content, valid_from, valid_to, fabric_id
+             FROM {}
+             WHERE id = ?1
+             ORDER BY valid_from ASC, valid_to ASC",
             table.as_str()
         );
 
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&sql)?;
-            let ts: Option<String> = stmt
-                .query_row(params![id.to_string(), FUTURE_SENTINEL_STR], |row| row.get(0))
-                .optional()?
-                .flatten();
-
-            ts.map(|value| parse_db_time(&value)).transpose()
+            let mapped = stmt.query_map(params![id.to_string()], Self::cell_from_row)?;
+            let mut result = Vec::new();
+            for row in mapped {
+                result.push(row?);
+            }
+            Ok(result)
         })
     }
 
-    pub fn reserve_next_version_timestamp(
-        &self,
-        id: Uuid,
-        candidate_ts: Timestamp,
-    ) -> Result<Timestamp> {
-        let data_latest = self.latest_materialized_ts_from_table(CellTable::Data, id)?;
-        let meta_latest = self.latest_materialized_ts_from_table(CellTable::Meta, id)?;
-        let latest = match (data_latest, meta_latest) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-
-        let next = match latest {
-            Some(prev) if candidate_ts <= prev => prev + chrono::Duration::microseconds(1),
-            _ => candidate_ts,
-        };
-
-        Ok(next)
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        self.with_conn(|conn| {
+            if let Some(cell) = Self::get_current_cell_from_table(conn, CellTable::Data, id)? {
+                return Ok(cell);
+            }
+            if let Some(cell) = Self::get_current_cell_from_table(conn, CellTable::Meta, id)? {
+                return Ok(cell);
+            }
+            Err(EngineError::NotFound)
+        })
     }
 
-    pub fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
+    fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
         if let Some(cell) = self.get_cell_at_from_table(CellTable::Data, id, ts)? {
             return Ok(cell);
         }
-
         if let Some(cell) = self.get_cell_at_from_table(CellTable::Meta, id, ts)? {
             return Ok(cell);
         }
-
         Err(EngineError::NotFound)
     }
 
-    fn active_table_for_id(&self, id: Uuid, ts: Timestamp) -> Result<Option<CellTable>> {
-        if self
-            .get_cell_at_from_table(CellTable::Data, id, ts)?
-            .is_some()
-        {
-            return Ok(Some(CellTable::Data));
-        }
-
-        if self
-            .get_cell_at_from_table(CellTable::Meta, id, ts)?
-            .is_some()
-        {
-            return Ok(Some(CellTable::Meta));
-        }
-
-        Ok(None)
+    fn active_table_for_id(&self, id: Uuid) -> Result<Option<CellTable>> {
+        self.with_conn(|conn| {
+            if Self::get_current_cell_from_table(conn, CellTable::Data, id)?.is_some() {
+                return Ok(Some(CellTable::Data));
+            }
+            if Self::get_current_cell_from_table(conn, CellTable::Meta, id)?.is_some() {
+                return Ok(Some(CellTable::Meta));
+            }
+            Ok(None)
+        })
     }
 
-    pub fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()> {
-        let Some(table) = self.active_table_for_id(id, now_ts)? else {
+    fn close_active_version(&self, id: Uuid) -> Result<()> {
+        let Some(table) = self.active_table_for_id(id)? else {
             return Err(EngineError::NotFound);
         };
 
         let sql = format!(
             "UPDATE {}
-             SET valid_to = ?2
-             WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2",
-            table.as_str()
+             SET valid_to = {}
+             WHERE id = ?1 AND valid_from <= {} AND valid_to > {}",
+            table.as_str(),
+            Self::SQLITE_NOW,
+            Self::SQLITE_NOW,
+            Self::SQLITE_NOW
         );
 
         self.with_conn(|conn| {
-            let changed = conn.execute(
-                &sql,
-                params![id.to_string(), format_db_time(&now_ts)],
-            )?;
+            let changed = conn.execute(&sql, params![id.to_string()])?;
             if changed == 0 {
                 return Err(EngineError::NotFound);
             }
 
             conn.execute(
-                "UPDATE fabric_cell
-             SET valid_to = ?2
-             WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2",
-                params![id.to_string(), format_db_time(&now_ts)],
+                &format!(
+                    "UPDATE fabric_cell
+                     SET valid_to = {}
+                     WHERE id = ?1 AND valid_from <= {} AND valid_to > {}",
+                    Self::SQLITE_NOW,
+                    Self::SQLITE_NOW,
+                    Self::SQLITE_NOW
+                ),
+                params![id.to_string()],
             )?;
 
             Ok(())
         })
     }
 
-    pub fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()> {
+    fn replace_cell_in_table(
+        &self,
+        table: CellTable,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.with_conn(|conn| {
+            let now = Self::current_db_time(conn)?;
+            let close_sql = format!(
+                "UPDATE {}
+                 SET valid_to = ?2
+                 WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2",
+                table.as_str()
+            );
+            let changed = conn.execute(&close_sql, params![id.to_string(), now.clone()])?;
+            if changed == 0 {
+                return Err(EngineError::NotFound);
+            }
+
+            conn.execute(
+                "UPDATE fabric_cell
+                 SET valid_to = ?2
+                 WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2",
+                params![id.to_string(), now.clone()],
+            )?;
+
+            let insert_sql = format!(
+                "INSERT INTO {} (id, cell_type, format, content, valid_from, fabric_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                table.as_str()
+            );
+            conn.execute(
+                &insert_sql,
+                params![
+                    id.to_string(),
+                    serde_json::to_string(cell_type)?,
+                    serde_json::to_string(format)?,
+                    content,
+                    now.clone(),
+                    fabric_id.map(|value| value.to_string()),
+                ],
+            )?;
+
+            if fabric_id.is_some() {
+                conn.execute(
+                    "INSERT INTO fabric_cell (id, valid_from) VALUES (?1, ?2)",
+                    params![id.to_string(), now],
+                )?;
+            }
+
+            Self::get_current_cell_from_table(conn, table, id)?.ok_or(EngineError::NotFound)
+        })
+    }
+
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
         self.with_conn(|conn| {
             if self.temporal_fabric_cells {
                 conn.execute(
-                    "UPDATE fabric_cells
-                 SET valid_to = ?4
+                    &format!(
+                        "UPDATE fabric_cells
+                 SET valid_to = {}
                  WHERE fabric_id = ?1
                    AND relation_type = ?2
                    AND ordinal = ?3
-                   AND valid_from <= ?4
-                   AND valid_to > ?4",
+                   AND valid_from <= {}
+                   AND valid_to > {}",
+                        Self::SQLITE_NOW,
+                        Self::SQLITE_NOW,
+                        Self::SQLITE_NOW
+                    ),
                     params![
                         fabric_cell.fabric_id.to_string(),
                         serde_json::to_string(&fabric_cell.relation_type)?,
                         fabric_cell.ordinal,
-                        format_db_time(&now_ts),
                     ],
                 )?;
 
                 conn.execute(
-                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal)
+                 VALUES (?1, ?2, ?3, ?4)",
                     params![
                         fabric_cell.fabric_id.to_string(),
                         fabric_cell.cell_id.to_string(),
                         serde_json::to_string(&fabric_cell.relation_type)?,
                         fabric_cell.ordinal,
-                        format_db_time(&now_ts),
-                        FUTURE_SENTINEL_STR,
                     ],
                 )?;
             } else {
@@ -440,7 +513,29 @@ impl SqliteStorage {
         })
     }
 
-    pub fn next_relation_ordinal(
+    fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT COALESCE(MAX(ordinal), -1) + 1
+                 FROM fabric_cells
+                 WHERE fabric_id = ?1
+                   AND relation_type = ?2
+                   AND valid_from <= {}
+                   AND valid_to > {}",
+                Self::SQLITE_NOW,
+                Self::SQLITE_NOW
+            ))?;
+
+            let ordinal: i64 = stmt.query_row(
+                params![fabric_id.to_string(), serde_json::to_string(relation_type)?],
+                |row| row.get(0),
+            )?;
+
+            Ok(ordinal)
+        })
+    }
+
+    fn next_relation_ordinal_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -469,7 +564,48 @@ impl SqliteStorage {
         })
     }
 
-    pub fn get_cells_by_relation(
+    fn get_cells_by_relation(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+    ) -> Result<Vec<Uuid>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT cell_id
+                 FROM fabric_cells
+                 WHERE fabric_id = ?1
+                   AND relation_type = ?2
+                   AND valid_from <= {}
+                   AND valid_to > {}
+                 ORDER BY ordinal ASC",
+                Self::SQLITE_NOW,
+                Self::SQLITE_NOW
+            ))?;
+
+            let mapped = stmt.query_map(
+                params![fabric_id.to_string(), serde_json::to_string(relation_type)?],
+                |row| {
+                    let cell_id_str: String = row.get(0)?;
+                    Uuid::parse_str(&cell_id_str).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })
+                },
+            )?;
+
+            let mut result = Vec::new();
+            for row in mapped {
+                result.push(row?);
+            }
+
+            Ok(result)
+        })
+    }
+
+    fn get_cells_by_relation_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
@@ -513,19 +649,20 @@ impl SqliteStorage {
         })
     }
 
-    pub fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT fabric_id, cell_id, relation_type, ordinal
-             FROM fabric_cells
-             WHERE fabric_id = ?1
-               AND valid_from <= ?2
-               AND valid_to > ?2
-             ORDER BY relation_type ASC, ordinal ASC",
-            )?;
+                 FROM fabric_cells
+                 WHERE fabric_id = ?1
+                   AND valid_from <= {}
+                   AND valid_to > {}
+                 ORDER BY relation_type ASC, ordinal ASC",
+                Self::SQLITE_NOW,
+                Self::SQLITE_NOW
+            ))?;
 
-            let mapped =
-                stmt.query_map(params![fabric_id.to_string(), format_db_time(&ts)], |row| {
+            let mapped = stmt.query_map(params![fabric_id.to_string()], |row| {
                 let fabric_id_str: String = row.get(0)?;
                 let cell_id_str: String = row.get(1)?;
                 let relation_type_str: String = row.get(2)?;
@@ -538,7 +675,6 @@ impl SqliteStorage {
                         Box::new(err),
                     )
                 })?;
-
                 let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
                         1,
@@ -546,7 +682,6 @@ impl SqliteStorage {
                         Box::new(err),
                     )
                 })?;
-
                 let relation_type = serde_json::from_str(&relation_type_str).map_err(|err| {
                     rusqlite::Error::FromSqlConversionFailure(
                         2,
@@ -571,67 +706,161 @@ impl SqliteStorage {
             Ok(result)
         })
     }
+
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT fabric_id, cell_id, relation_type, ordinal
+             FROM fabric_cells
+             WHERE fabric_id = ?1
+               AND valid_from <= ?2
+               AND valid_to > ?2
+             ORDER BY relation_type ASC, ordinal ASC",
+            )?;
+
+            let mapped =
+                stmt.query_map(params![fabric_id.to_string(), format_db_time(&ts)], |row| {
+                    let fabric_id_str: String = row.get(0)?;
+                    let cell_id_str: String = row.get(1)?;
+                    let relation_type_str: String = row.get(2)?;
+                    let ordinal: i64 = row.get(3)?;
+
+                    let fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+
+                    let cell_id = Uuid::parse_str(&cell_id_str).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+
+                    let relation_type =
+                        serde_json::from_str(&relation_type_str).map_err(|err| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(err),
+                            )
+                        })?;
+
+                    Ok(FabricCell {
+                        fabric_id,
+                        cell_id,
+                        relation_type,
+                        ordinal,
+                    })
+                })?;
+
+            let mut result = Vec::new();
+            for row in mapped {
+                result.push(row?);
+            }
+
+            Ok(result)
+        })
+    }
 }
 
 impl Storage for SqliteStorage {
-    fn current_query_timestamp(&self) -> Result<Timestamp> {
-        self.with_conn(|conn| {
-            let now: String = conn.query_row(
-                "SELECT STRFTIME('%Y-%m-%d %H:%M:%f', 'now')",
-                params![],
-                |row| row.get(0),
-            )?;
-            parse_db_time(&now)
-        })
-    }
-
-    fn active_valid_to_sentinel(&self) -> Timestamp {
-        future_sentinel()
-    }
-
-    fn insert_cell(&self, cell: &Cell) -> Result<()> {
-        SqliteStorage::insert_cell(self, cell)
-    }
-
-    fn reserve_next_version_timestamp(
+    fn insert_cell(
         &self,
         id: Uuid,
-        candidate_ts: Timestamp,
-    ) -> Result<Timestamp> {
-        SqliteStorage::reserve_next_version_timestamp(self, id, candidate_ts)
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        self.insert_cell_in_table(
+            Self::table_for_cell_type(cell_type),
+            id,
+            cell_type,
+            format,
+            content,
+            fabric_id,
+        )
+    }
+
+    fn replace_cell(
+        &self,
+        id: Uuid,
+        cell_type: &CellType,
+        format: &ContentFormat,
+        content: &[u8],
+        fabric_id: Option<Uuid>,
+    ) -> Result<Cell> {
+        let table = Self::table_for_cell_type(cell_type);
+        self.replace_cell_in_table(table, id, cell_type, format, content, fabric_id)
+    }
+
+    fn delete_cell(&self, id: Uuid) -> Result<()> {
+        self.close_active_version(id)
+    }
+
+    fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        SqliteStorage::get_cell(self, id)
     }
 
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
         SqliteStorage::get_cell_at(self, id, ts)
     }
 
-    fn close_active_version(&self, id: Uuid, now_ts: Timestamp) -> Result<()> {
-        SqliteStorage::close_active_version(self, id, now_ts)
+    fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
+        let mut rows = self.get_cell_history_from_table(CellTable::Data, id)?;
+        rows.extend(self.get_cell_history_from_table(CellTable::Meta, id)?);
+        rows.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then(a.valid_to.cmp(&b.valid_to))
+        });
+        Ok(rows)
     }
 
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell, now_ts: Timestamp) -> Result<()> {
-        SqliteStorage::insert_fabric_cell(self, fabric_cell, now_ts)
+    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
+        SqliteStorage::insert_fabric_cell(self, fabric_cell)
     }
 
-    fn next_relation_ordinal(
+    fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64> {
+        SqliteStorage::next_relation_ordinal(self, fabric_id, relation_type)
+    }
+
+    fn next_relation_ordinal_at(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
         ts: Timestamp,
     ) -> Result<i64> {
-        SqliteStorage::next_relation_ordinal(self, fabric_id, relation_type, ts)
+        SqliteStorage::next_relation_ordinal_at(self, fabric_id, relation_type, ts)
     }
 
     fn get_cells_by_relation(
         &self,
         fabric_id: Uuid,
         relation_type: &RelationType,
-        ts: Timestamp,
     ) -> Result<Vec<Uuid>> {
-        SqliteStorage::get_cells_by_relation(self, fabric_id, relation_type, ts)
+        SqliteStorage::get_cells_by_relation(self, fabric_id, relation_type)
     }
 
-    fn get_fabric_cells(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
-        SqliteStorage::get_fabric_cells(self, fabric_id, ts)
+    fn get_cells_by_relation_at(
+        &self,
+        fabric_id: Uuid,
+        relation_type: &RelationType,
+        ts: Timestamp,
+    ) -> Result<Vec<Uuid>> {
+        SqliteStorage::get_cells_by_relation_at(self, fabric_id, relation_type, ts)
+    }
+
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
+        SqliteStorage::get_fabric_cells(self, fabric_id)
+    }
+
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+        SqliteStorage::get_fabric_cells_at(self, fabric_id, ts)
     }
 }

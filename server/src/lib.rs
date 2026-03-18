@@ -88,6 +88,8 @@ type ApiResult<T> = Result<Json<T>, ApiError>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DocumentResponse {
+    // Wire compatibility: the public concept is Document, while the current payload
+    // still carries the root Cell representation directly.
     pub root_cell_id: Uuid,
     pub root: Cell,
 }
@@ -139,7 +141,7 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, ApiError> {
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
         .map_err(|err| ApiError::bad_request(format!("invalid timestamp '{value}': {err}")))?;
-    Ok(DateTime::<Utc>::from_utc(naive, Utc))
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
 pub fn router(context: AppContext) -> Router {
@@ -169,22 +171,22 @@ async fn api_index() -> Json<ApiIndex> {
             ApiRoute {
                 method: "POST",
                 path: "/documents",
-                description: "Create a new document",
+                description: "Create a new document; the current response carries the root cell payload",
             },
             ApiRoute {
                 method: "GET",
                 path: "/documents/{id}",
-                description: "Fetch current document state",
+                description: "Fetch the current document view through its root cell payload",
             },
             ApiRoute {
                 method: "PUT",
                 path: "/documents/{id}",
-                description: "Create next document version",
+                description: "Create the next document version by updating the root cell payload",
             },
             ApiRoute {
                 method: "GET",
                 path: "/documents/{id}/history?timestamp=<ts>",
-                description: "Fetch document at specific timestamp",
+                description: "Fetch the document view at a specific timestamp through its root cell payload",
             },
         ],
     })
@@ -217,7 +219,7 @@ async fn get_document(
     State(context): State<AppContext>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<DocumentResponse> {
-    let doc = context.with_engine(|engine| engine.get_current(id))?;
+    let doc = context.with_engine(|engine| engine.get_cell(id))?;
     Ok(Json(DocumentResponse::from_root(doc)))
 }
 
@@ -242,6 +244,6 @@ async fn get_document_history(
         ));
     };
     let parsed = parse_timestamp(&timestamp)?;
-    let doc = context.with_engine(|engine| engine.get_at_time(id, parsed))?;
+    let doc = context.with_engine(|engine| engine.get_cell_at(id, parsed))?;
     Ok(Json(DocumentResponse::from_root(doc)))
 }

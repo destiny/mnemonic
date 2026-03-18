@@ -2,6 +2,7 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
+use chrono::SecondsFormat;
 use http_body_util::BodyExt;
 use mnemonic_engine::{CellType, ContentFormat, Engine};
 use mnemonic_server::{AppContext, DocumentResponse, router};
@@ -83,7 +84,12 @@ async fn create_get_update_and_history_document() {
     let current: DocumentResponse = serde_json::from_slice(&get_bytes).unwrap();
     assert_eq!(current.root.content, b"# Draft".to_vec());
 
-    let history_ts = current.root.valid_from.to_rfc3339();
+    let history_ts = current
+        .root
+        .valid_from
+        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
 
     let update_payload = r##"{"content":"# Draft v2"}"##;
     let update_response = app

@@ -1,9 +1,9 @@
+use chrono::Utc;
 use std::fs;
 use std::path::{Path, PathBuf};
-use chrono::Utc;
 
-use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType, Timestamp};
 use mnemonic_engine::storage::time::format_db_time;
+use mnemonic_engine::{CellType, ContentFormat, Engine, RelationType, Timestamp};
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
@@ -782,7 +782,7 @@ fn store_scenario_into_engine(
     );
 
     let root = engine
-        .create_cell(
+        .create_cell_with_fabric(
             CellType::Container,
             ContentFormat::Json,
             root_payload.into_bytes(),
@@ -876,11 +876,9 @@ fn get_active_content(conn: &Connection, id: Uuid) -> String {
         LIMIT 1
     ";
     let bytes: Vec<u8> = conn
-        .query_row(
-            sql,
-            params![id.to_string(), format_db_time(&now)],
-            |row| row.get(0),
-        )
+        .query_row(sql, params![id.to_string(), format_db_time(&now)], |row| {
+            row.get(0)
+        })
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -906,9 +904,9 @@ fn query_children_by_relation(
     stmt.query_map(
         params![root_id.to_string(), relation_json, format_db_time(&now)],
         |row| {
-        let cell_id: String = row.get(0)?;
-        Ok(Uuid::parse_str(&cell_id).unwrap())
-    },
+            let cell_id: String = row.get(0)?;
+            Ok(Uuid::parse_str(&cell_id).unwrap())
+        },
     )
     .unwrap()
     .map(|row| row.unwrap())

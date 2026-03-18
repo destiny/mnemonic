@@ -4,10 +4,11 @@
 
 ## Design
 
-- **Document Root**: The API uses `Document` as the public concept and returns the document root cell as `root`.
+- **Public Concept**: The API uses `Document` as the public concept.
+- **Current Wire Shape**: The current response payload still carries the root `Cell` as `root`. This is a wire-shape detail for compatibility, not a redefinition of the public model.
 - **Ownership Model**: A document owns one root cell, and that root cell may reference fabric-backed structure.
 - **Context**: `AppContext` is the communication container that shares engine state across handlers.
-- **Authority**: Temporal behavior and invariants remain in `mnemonic-engine`.
+- **Authority**: Document behavior stays in the engine layer, while temporal validity mechanics remain storage-backed behavior exposed through engine APIs.
 
 ## Run
 
@@ -24,10 +25,10 @@ Environment variables:
 
 - `GET /` - API route index for simple navigation
 - `GET /health` - health check
-- `POST /documents` - create a document root
-- `GET /documents/{id}` - get current document root
-- `PUT /documents/{id}` - update document root content (new temporal version)
-- `GET /documents/{id}/history?timestamp=<ts>` - retrieve document root at timestamp (`RFC3339` or `YYYY-MM-DD HH:MM:SS[.ffffff]`)
+- `POST /documents` - create a document; response currently returns the root cell payload
+- `GET /documents/{id}` - get the current document view through the root cell payload
+- `PUT /documents/{id}` - update the document by replacing the root cell content with a new version
+- `GET /documents/{id}/history?timestamp=<ts>` - retrieve the document view at timestamp (`RFC3339` or `YYYY-MM-DD HH:MM:SS[.ffffff]`)
 
 ## Quick Evaluation
 
@@ -40,6 +41,12 @@ curl -s -X POST localhost:3000/documents \
 ```
 
 Response shape:
+
+Compatibility note:
+
+- The public API concept is `Document`
+- The current payload carrier is the root `Cell`
+- This response shape preserves compatibility while the application model remains document-first
 
 ```json
 {

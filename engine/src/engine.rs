@@ -14,7 +14,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -135,64 +134,18 @@ impl Engine {
     }
 
     fn refresh_context_cache(&self, fabric_id: Uuid) -> Result<()> {
-        let context = self.build_context_with_timestamp(fabric_id, None)?;
+        let context = self.build_context_for_timestamp(fabric_id, None)?;
         self.context_cache.borrow_mut().insert(fabric_id, context);
         Ok(())
     }
 
-    fn now_ts(&self) -> Result<Timestamp> {
-        self.storage.current_query_timestamp()
-    }
-
-    fn reserve_next_version_ts(&self, cell_id: Uuid) -> Result<Timestamp> {
-        let candidate = self.now_ts()?;
-        let now = self
-            .storage
-            .reserve_next_version_timestamp(cell_id, candidate)?;
-        let mut observed = candidate;
-        while observed < now {
-            let remaining = now.signed_duration_since(observed);
-            let micros = remaining.num_microseconds().unwrap_or(0).max(0) as u64;
-            if micros == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_micros(micros.min(100)));
-            observed = self.now_ts()?;
-        }
-        Ok(now)
-    }
-
-    fn default_fabric_id_for_cell_type(cell_id: Uuid, cell_type: &CellType) -> Option<Uuid> {
-        match cell_type {
-            CellType::Container => Some(cell_id),
-            CellType::Custom(value) if value.starts_with("document.") => Some(cell_id),
-            _ => None,
-        }
-    }
-
-    fn ensure_cell_fabric(&self, cell_id: Uuid) -> Result<Uuid> {
-        let cell = self.get_current(cell_id)?;
-        if let Some(fabric_id) = cell.fabric_id {
-            return Ok(fabric_id);
-        }
-
-        let now = self.reserve_next_version_ts(cell_id)?;
-        self.storage.close_active_version(cell_id, now)?;
-
-        let next = Cell {
-            id: cell.id,
-            cell_type: cell.cell_type,
-            format: cell.format,
-            content: cell.content,
-            valid_from: now,
-            valid_to: self.storage.active_valid_to_sentinel(),
-            fabric_id: Some(cell.id),
-        };
-
-        self.storage.insert_cell(&next)?;
-        self.clear_context_cache();
-
-        Ok(next.fabric_id.expect("fabric id assigned"))
+    fn require_cell_fabric(&self, cell_id: Uuid) -> Result<Uuid> {
+        let cell = self.get_cell(cell_id)?;
+        cell.fabric_id.ok_or_else(|| {
+            EngineError::InvalidData(format!(
+                "cell {cell_id} does not reference a fabric; create it with fabric ownership before adding fabric members"
+            ))
+        })
     }
 
     pub fn create_cell(
@@ -201,35 +154,39 @@ impl Engine {
         format: ContentFormat,
         content: Vec<u8>,
     ) -> Result<Cell> {
-        let now = self.now_ts()?;
         let id = Uuid::now_v7();
-        let fabric_id = Self::default_fabric_id_for_cell_type(id, &cell_type);
+        let cell = self
+            .storage
+            .insert_cell(id, &cell_type, &format, &content, None)?;
+        self.clear_context_cache();
 
-        let cell = Cell {
-            id,
-            cell_type,
-            format,
-            content,
-            valid_from: now,
-            valid_to: self.storage.active_valid_to_sentinel(),
-            fabric_id,
-        };
+        Ok(cell)
+    }
 
-        self.storage.insert_cell(&cell)?;
+    pub fn create_cell_with_fabric(
+        &self,
+        cell_type: CellType,
+        format: ContentFormat,
+        content: Vec<u8>,
+    ) -> Result<Cell> {
+        let id = Uuid::now_v7();
+        let cell = self
+            .storage
+            .insert_cell(id, &cell_type, &format, &content, Some(id))?;
         self.clear_context_cache();
 
         Ok(cell)
     }
 
     pub fn update_cell_content(&self, cell_id: Uuid, new_content: Vec<u8>) -> Result<Cell> {
-        let mut cell = self.get_current(cell_id)?;
-        let now = self.reserve_next_version_ts(cell_id)?;
-
-        self.storage.close_active_version(cell_id, now)?;
-        cell.content = new_content;
-        cell.valid_from = now;
-        cell.valid_to = self.storage.active_valid_to_sentinel();
-        self.storage.insert_cell(&cell)?;
+        let cell = self.get_cell(cell_id)?;
+        let cell = self.storage.replace_cell(
+            cell.id,
+            &cell.cell_type,
+            &cell.format,
+            &new_content,
+            cell.fabric_id,
+        )?;
         self.clear_context_cache();
 
         Ok(cell)
@@ -242,7 +199,7 @@ impl Engine {
         remote: VersionCandidate,
         strategy: ConflictStrategy,
     ) -> Result<Cell> {
-        let mut cell = self.get_current(cell_id)?;
+        let cell = self.get_cell(cell_id)?;
 
         let winner = match strategy {
             ConflictStrategy::LastWriteWins => {
@@ -273,13 +230,13 @@ impl Engine {
             ));
         }
 
-        let now = self.reserve_next_version_ts(cell_id)?;
-        self.storage.close_active_version(cell_id, now)?;
-
-        cell.content = winner.content;
-        cell.valid_from = now;
-        cell.valid_to = self.storage.active_valid_to_sentinel();
-        self.storage.insert_cell(&cell)?;
+        let cell = self.storage.replace_cell(
+            cell.id,
+            &cell.cell_type,
+            &cell.format,
+            &winner.content,
+            cell.fabric_id,
+        )?;
         self.clear_context_cache();
 
         Ok(cell)
@@ -292,13 +249,12 @@ impl Engine {
         relation_type: RelationType,
         ordinal: Option<i64>,
     ) -> Result<()> {
-        let fabric_id = self.ensure_cell_fabric(root_cell_id)?;
-        let now = self.now_ts()?;
+        let fabric_id = self.require_cell_fabric(root_cell_id)?;
         let resolved_ordinal = match ordinal {
             Some(value) => value,
             None => self
                 .storage
-                .next_relation_ordinal(fabric_id, &relation_type, now)?,
+                .next_relation_ordinal(fabric_id, &relation_type)?,
         };
 
         let fabric_cell = FabricCell {
@@ -308,7 +264,7 @@ impl Engine {
             ordinal: resolved_ordinal,
         };
 
-        self.storage.insert_fabric_cell(&fabric_cell, now)?;
+        self.storage.insert_fabric_cell(&fabric_cell)?;
         self.clear_context_cache();
 
         Ok(())
@@ -319,13 +275,13 @@ impl Engine {
         root_cell_id: Uuid,
         relation_type: RelationType,
     ) -> Result<Vec<Uuid>> {
-        let root = self.get_current(root_cell_id)?;
+        let root = self.get_cell(root_cell_id)?;
         let Some(fabric_id) = root.fabric_id else {
             return Ok(Vec::new());
         };
 
         self.storage
-            .get_cells_by_relation(fabric_id, &relation_type, self.now_ts()?)
+            .get_cells_by_relation(fabric_id, &relation_type)
     }
 
     pub fn update_cell(&self, cell: &Cell) -> Result<()> {
@@ -334,20 +290,13 @@ impl Engine {
     }
 
     fn update_cell_and_refresh(&self, cell: &Cell) -> Result<Cell> {
-        let now = self.reserve_next_version_ts(cell.id)?;
-
-        self.storage.close_active_version(cell.id, now)?;
-        let next = Cell {
-            id: cell.id,
-            cell_type: cell.cell_type.clone(),
-            format: cell.format.clone(),
-            content: cell.content.clone(),
-            valid_from: now,
-            valid_to: self.storage.active_valid_to_sentinel(),
-            fabric_id: cell.fabric_id,
-        };
-
-        self.storage.insert_cell(&next)?;
+        let next = self.storage.replace_cell(
+            cell.id,
+            &cell.cell_type,
+            &cell.format,
+            &cell.content,
+            cell.fabric_id,
+        )?;
         self.clear_context_cache();
 
         Ok(next)
@@ -358,7 +307,7 @@ impl Engine {
         root_cell_id: Uuid,
         timestamp: Option<Timestamp>,
     ) -> Result<DocumentContext<'_>> {
-        let context = self.build_context_with_timestamp(root_cell_id, timestamp)?;
+        let context = self.build_context_for_timestamp(root_cell_id, timestamp)?;
         let mut cells = HashMap::new();
         for cell in context.cells {
             cells.insert(cell.id, cell);
@@ -372,25 +321,26 @@ impl Engine {
         })
     }
 
-    pub fn get_cell_at(&self, id: Uuid, timestamp: Option<Timestamp>) -> Result<Cell> {
-        let resolved_ts = match timestamp {
-            Some(value) => value,
-            None => self.now_ts()?,
-        };
-
-        self.storage.get_cell_at(id, resolved_ts)
+    pub fn get_cell(&self, id: Uuid) -> Result<Cell> {
+        self.storage.get_cell(id)
     }
 
-    pub fn get_current(&self, id: Uuid) -> Result<Cell> {
-        self.get_cell_at(id, None)
+    pub fn get_cell_at(&self, id: Uuid, timestamp: Timestamp) -> Result<Cell> {
+        self.storage.get_cell_at(id, timestamp)
     }
 
-    pub fn get_at_time(&self, id: Uuid, timestamp: Timestamp) -> Result<Cell> {
-        self.get_cell_at(id, Some(timestamp))
+    pub fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
+        self.storage.get_cell_history(id)
+    }
+
+    pub fn delete_cell(&self, id: Uuid) -> Result<()> {
+        self.storage.delete_cell(id)?;
+        self.clear_context_cache();
+        Ok(())
     }
 
     pub fn build_context(&self, root_cell_id: Uuid) -> Result<FabricContext> {
-        self.build_context_with_timestamp(root_cell_id, None)
+        self.build_context_for_timestamp(root_cell_id, None)
     }
 
     pub fn build_context_at_time(
@@ -398,10 +348,10 @@ impl Engine {
         root_cell_id: Uuid,
         timestamp: Timestamp,
     ) -> Result<FabricContext> {
-        self.build_context_with_timestamp(root_cell_id, Some(timestamp))
+        self.build_context_for_timestamp(root_cell_id, Some(timestamp))
     }
 
-    pub fn build_context_with_timestamp(
+    fn build_context_for_timestamp(
         &self,
         root_cell_id: Uuid,
         timestamp: Option<Timestamp>,
@@ -412,12 +362,10 @@ impl Engine {
             }
         }
 
-        let resolved_ts = match timestamp {
-            Some(value) => value,
-            None => self.now_ts()?,
+        let root = match timestamp {
+            Some(value) => self.get_cell_at(root_cell_id, value)?,
+            None => self.get_cell(root_cell_id)?,
         };
-
-        let root = self.get_at_time(root_cell_id, resolved_ts)?;
 
         let mut seen: HashSet<Uuid> = HashSet::new();
         let mut queue = VecDeque::new();
@@ -429,15 +377,24 @@ impl Engine {
         queue.push_back(root.id);
 
         while let Some(cell_id) = queue.pop_front() {
-            let current = self.get_at_time(cell_id, resolved_ts)?;
+            let current = match timestamp {
+                Some(value) => self.get_cell_at(cell_id, value)?,
+                None => self.get_cell(cell_id)?,
+            };
             let Some(fabric_id) = current.fabric_id else {
                 continue;
             };
 
-            let current_fabric_cells = self.storage.get_fabric_cells(fabric_id, resolved_ts)?;
+            let current_fabric_cells = match timestamp {
+                Some(value) => self.storage.get_fabric_cells_at(fabric_id, value)?,
+                None => self.storage.get_fabric_cells(fabric_id)?,
+            };
             for fabric_cell in current_fabric_cells {
                 if seen.insert(fabric_cell.cell_id) {
-                    let child = self.get_at_time(fabric_cell.cell_id, resolved_ts)?;
+                    let child = match timestamp {
+                        Some(value) => self.get_cell_at(fabric_cell.cell_id, value)?,
+                        None => self.get_cell(fabric_cell.cell_id)?,
+                    };
                     cells.push(child);
                     queue.push_back(fabric_cell.cell_id);
                 }
@@ -457,9 +414,5 @@ impl Engine {
         }
 
         Ok(context)
-    }
-
-    pub fn get_cell(&self, id: Uuid) -> Result<Cell> {
-        self.get_current(id)
     }
 }

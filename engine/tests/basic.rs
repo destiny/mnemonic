@@ -49,7 +49,7 @@ fn spec_cell_uses_max_time_and_current_lookup() {
     assert!(cell.valid_from <= now);
     assert!(cell.valid_to > now);
 
-    let current = engine.get_current(cell.id).unwrap();
+    let current = engine.get_cell(cell.id).unwrap();
     assert_eq!(current.content, b"hello".to_vec());
     assert!(current.valid_from <= now_ts());
     assert!(current.valid_to > now_ts());
@@ -68,10 +68,10 @@ fn spec_temporal_window_boundary_on_update() {
     let updated = engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
 
     // AGENTS window semantics: valid_from <= T < valid_to.
-    let old_at_before = engine.get_at_time(cell.id, before_update).unwrap();
+    let old_at_before = engine.get_cell_at(cell.id, before_update).unwrap();
     assert_eq!(old_at_before.content, b"v1".to_vec());
 
-    let at_boundary = engine.get_at_time(cell.id, updated.valid_from).unwrap();
+    let at_boundary = engine.get_cell_at(cell.id, updated.valid_from).unwrap();
     assert_eq!(at_boundary.content, b"v2".to_vec());
     assert!(at_boundary.valid_to > at_boundary.valid_from);
 }
@@ -121,7 +121,7 @@ fn spec_temporal_fabric_cells_when_enabled() {
     .unwrap();
 
     let parent = engine
-        .create_cell(CellType::Container, ContentFormat::Json, vec![])
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
         .unwrap();
     let first = engine
         .create_cell(CellType::Raw, ContentFormat::Text, b"first".to_vec())
@@ -169,14 +169,14 @@ fn e2e_lifecycle_black_box_acceptance() {
         .create_cell(CellType::Raw, ContentFormat::Text, b"Hello world!".to_vec())
         .unwrap();
     let digested = engine
-        .create_cell(
+        .create_cell_with_fabric(
             CellType::Digested,
             ContentFormat::Text,
             b"HELLO WORLD!".to_vec(),
         )
         .unwrap();
     let container = engine
-        .create_cell(CellType::Container, ContentFormat::Json, vec![])
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
         .unwrap();
 
     engine
@@ -201,8 +201,8 @@ fn e2e_lifecycle_black_box_acceptance() {
         .update_cell_content(raw.id, b"Updated content".to_vec())
         .unwrap();
 
-    let current_raw = engine.get_current(raw.id).unwrap();
-    let historical_raw = engine.get_at_time(raw.id, before_update).unwrap();
+    let current_raw = engine.get_cell(raw.id).unwrap();
+    let historical_raw = engine.get_cell_at(raw.id, before_update).unwrap();
     assert_eq!(current_raw.content, b"Updated content".to_vec());
     assert_eq!(historical_raw.content, b"Hello world!".to_vec());
 
@@ -217,7 +217,7 @@ fn context_defers_writes_until_save() {
     let engine = Engine::new(":memory:").unwrap();
 
     let root = engine
-        .create_cell(CellType::Container, ContentFormat::Json, vec![])
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
         .unwrap();
     let child = engine
         .create_cell(CellType::Raw, ContentFormat::Text, b"original".to_vec())
@@ -231,12 +231,12 @@ fn context_defers_writes_until_save() {
         .update_cell_content(child.id, b"draft".to_vec())
         .unwrap();
 
-    let db_before_save = engine.get_current(child.id).unwrap();
+    let db_before_save = engine.get_cell(child.id).unwrap();
     assert_eq!(db_before_save.content, b"original".to_vec());
 
     context.save().unwrap();
 
-    let db_after_save = engine.get_current(child.id).unwrap();
+    let db_after_save = engine.get_cell(child.id).unwrap();
     assert_eq!(db_after_save.content, b"draft".to_vec());
 }
 
@@ -254,9 +254,68 @@ fn optional_timestamp_uses_current_when_missing_and_history_when_present() {
 
     engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
 
-    let current_via_optional = engine.get_cell_at(cell.id, None).unwrap();
-    let historical_via_optional = engine.get_cell_at(cell.id, Some(ts_before_update)).unwrap();
+    let current_via_optional = engine.get_cell(cell.id).unwrap();
+    let historical_via_optional = engine.get_cell_at(cell.id, ts_before_update).unwrap();
 
     assert_eq!(current_via_optional.content, b"v2".to_vec());
     assert_eq!(historical_via_optional.content, b"v1".to_vec());
+}
+
+#[test]
+fn delete_closes_live_row_but_preserves_history() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"alive".to_vec())
+        .unwrap();
+    let created_at = cell.valid_from;
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    engine.delete_cell(cell.id).unwrap();
+
+    assert!(matches!(
+        engine.get_cell(cell.id),
+        Err(mnemonic_engine::EngineError::NotFound)
+    ));
+
+    let historical = engine.get_cell_at(cell.id, created_at).unwrap();
+    assert_eq!(historical.content, b"alive".to_vec());
+}
+
+#[test]
+fn full_history_returns_all_versions_in_order() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let cell = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"v1".to_vec())
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    engine.update_cell_content(cell.id, b"v2".to_vec()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    engine.update_cell_content(cell.id, b"v3".to_vec()).unwrap();
+
+    let history = engine.get_cell_history(cell.id).unwrap();
+    let contents: Vec<Vec<u8>> = history.into_iter().map(|cell| cell.content).collect();
+    assert_eq!(
+        contents,
+        vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()]
+    );
+}
+
+#[test]
+fn adding_fabric_members_requires_a_fabric_backed_owner_cell() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let owner = engine
+        .create_cell(CellType::Data, ContentFormat::Json, vec![])
+        .unwrap();
+    let child = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"child".to_vec())
+        .unwrap();
+
+    let err = engine
+        .add_fabric_cell(owner.id, child.id, RelationType::Contains, None)
+        .unwrap_err();
+
+    assert!(matches!(err, mnemonic_engine::EngineError::InvalidData(_)));
 }
