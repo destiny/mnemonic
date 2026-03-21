@@ -17,9 +17,9 @@ use std::sync::Mutex;
 use mysql::{Conn, Opts, Row, params, prelude::Queryable};
 use uuid::Uuid;
 
-use super::Storage;
+use super::{FabricMemberRow, FabricRecord, Storage};
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::models::{Cell, CellType, ContentFormat, RelationType, Timestamp};
 use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,10 +30,7 @@ enum CellTable {
 
 impl CellTable {
     fn as_str(self) -> &'static str {
-        match self {
-            Self::Data => "data_cell",
-            Self::Meta => "meta_cell",
-        }
+        "cell"
     }
 }
 
@@ -44,6 +41,10 @@ pub struct MySqlStorage {
 
 impl MySqlStorage {
     const NOW_EXPR: &'static str = "CURRENT_TIMESTAMP(6)";
+
+    fn root_relation_value() -> Result<String> {
+        Ok(serde_json::to_string(&RelationType::Root)?)
+    }
 
     pub fn new(connection_str: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let opts = Opts::from_url(connection_str)
@@ -71,7 +72,16 @@ impl MySqlStorage {
     fn init(&self) -> Result<()> {
         self.with_conn(|conn| {
             conn.query_drop(
-                "CREATE TABLE IF NOT EXISTS data_cell (
+                "CREATE TABLE IF NOT EXISTS fabric (
+                    id VARCHAR(36) NOT NULL,
+                    valid_from DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                    valid_to DATETIME(6) NOT NULL DEFAULT '2100-01-01 00:00:00.000000',
+                    PRIMARY KEY (id, valid_to)
+                )",
+            )?;
+
+            conn.query_drop(
+                "CREATE TABLE IF NOT EXISTS cell (
                     id VARCHAR(36) NOT NULL,
                     cell_type TEXT NOT NULL,
                     format TEXT NOT NULL,
@@ -79,28 +89,6 @@ impl MySqlStorage {
                     valid_from DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                     valid_to DATETIME(6) NOT NULL DEFAULT '2100-01-01 00:00:00.000000',
                     fabric_id TEXT NULL,
-                    PRIMARY KEY (id, valid_to)
-                )",
-            )?;
-
-            conn.query_drop(
-                "CREATE TABLE IF NOT EXISTS meta_cell (
-                    id VARCHAR(36) NOT NULL,
-                    cell_type TEXT NOT NULL,
-                    format TEXT NOT NULL,
-                    content BLOB NOT NULL,
-                    valid_from DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                    valid_to DATETIME(6) NOT NULL DEFAULT '2100-01-01 00:00:00.000000',
-                    fabric_id TEXT NULL,
-                    PRIMARY KEY (id, valid_to)
-                )",
-            )?;
-
-            conn.query_drop(
-                "CREATE TABLE IF NOT EXISTS fabric_cell (
-                    id VARCHAR(36) NOT NULL,
-                    valid_from DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                    valid_to DATETIME(6) NOT NULL DEFAULT '2100-01-01 00:00:00.000000',
                     PRIMARY KEY (id, valid_to)
                 )",
             )?;
@@ -110,22 +98,40 @@ impl MySqlStorage {
                     fabric_id VARCHAR(36) NOT NULL,
                     cell_id VARCHAR(36) NOT NULL,
                     relation_type VARCHAR(255) NOT NULL,
-                    ordinal BIGINT NOT NULL,
+                    ordinal BIGINT NULL,
                     valid_from DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
                     valid_to DATETIME(6) NOT NULL DEFAULT '2100-01-01 00:00:00.000000',
-                    PRIMARY KEY (fabric_id, relation_type, ordinal, valid_to)
+                    PRIMARY KEY (fabric_id, relation_type, cell_id, valid_to)
                 )",
+            )?;
+
+            conn.query_drop(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fabric_one_active_per_id
+                 ON fabric(id, valid_to)",
+            )?;
+
+            conn.query_drop(
+                "CREATE UNIQUE INDEX IF NOT EXISTS cell_one_active_per_id
+                 ON cell(id, valid_to)",
+            )?;
+
+            conn.query_drop(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fabric_cells_one_active_per_slot
+                 ON fabric_cells(fabric_id, relation_type, ordinal, valid_to)",
+            )?;
+
+            conn.query_drop(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fabric_cells_one_active_root
+                 ON fabric_cells(fabric_id, relation_type, valid_to)",
+            )?;
+
+            conn.query_drop(
+                "CREATE INDEX IF NOT EXISTS cell_current_lookup
+                 ON cell(id, valid_from, valid_to)",
             )?;
 
             Ok(())
         })
-    }
-
-    fn table_for_cell_type(cell_type: &CellType) -> CellTable {
-        match cell_type {
-            CellType::Meta => CellTable::Meta,
-            _ => CellTable::Data,
-        }
     }
 
     fn insert_cell_in_table(
@@ -157,11 +163,20 @@ impl MySqlStorage {
                 },
             )?;
 
-            if fabric_id.is_some() {
+            if let Some(fabric_id) = fabric_id {
                 conn.exec_drop(
-                    "INSERT INTO fabric_cell (id) VALUES (:id)",
+                    "INSERT INTO fabric (id) VALUES (:id)",
+                    params! {"id" => fabric_id.to_string()},
+                )?;
+                conn.exec_drop(
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
+                     VALUES (:fabric_id, :cell_id, :relation_type, NULL, :valid_from, :valid_to)",
                     params! {
-                        "id" => id.to_string(),
+                        "fabric_id" => fabric_id.to_string(),
+                        "cell_id" => id.to_string(),
+                        "relation_type" => Self::root_relation_value()?,
+                        "valid_from" => MIN_TIMESTAMP_STR,
+                        "valid_to" => FUTURE_SENTINEL_STR,
                     },
                 )?;
             }
@@ -212,6 +227,20 @@ impl MySqlStorage {
             valid_from,
             valid_to,
             fabric_id,
+        })
+    }
+
+    fn fabric_from_row(row: Row) -> Result<FabricRecord> {
+        let (id_str, valid_from_str, valid_to_str): (String, String, String) =
+            mysql::from_row_opt(row).map_err(|err| {
+                EngineError::InvalidData(format!("invalid fabric row shape: {err}"))
+            })?;
+        Ok(FabricRecord {
+            id: Uuid::parse_str(&id_str).map_err(|err| {
+                EngineError::InvalidData(format!("invalid fabric UUID in row: {err}"))
+            })?,
+            valid_from: parse_db_time(&valid_from_str)?,
+            valid_to: parse_db_time(&valid_to_str)?,
         })
     }
 
@@ -339,23 +368,22 @@ impl MySqlStorage {
             if conn.affected_rows() == 0 {
                 return Err(EngineError::NotFound);
             }
-            conn.exec_drop(
-                &format!(
-                    "UPDATE fabric_cell
-                     SET valid_to = {}
-                     WHERE id = :id AND valid_from <= {} AND valid_to > {}",
-                    Self::NOW_EXPR,
-                    Self::NOW_EXPR,
-                    Self::NOW_EXPR
-                ),
-                params! { "id" => id.to_string() },
-            )?;
             Ok(())
         })
     }
 }
 
 impl Storage for MySqlStorage {
+    fn insert_fabric(&self, id: Uuid) -> Result<FabricRecord> {
+        self.with_conn(|conn| {
+            conn.exec_drop(
+                "INSERT INTO fabric (id) VALUES (:id)",
+                params! {"id" => id.to_string()},
+            )?;
+            self.get_fabric(id)
+        })
+    }
+
     fn insert_cell(
         &self,
         id: Uuid,
@@ -364,14 +392,7 @@ impl Storage for MySqlStorage {
         content: &[u8],
         fabric_id: Option<Uuid>,
     ) -> Result<Cell> {
-        self.insert_cell_in_table(
-            Self::table_for_cell_type(cell_type),
-            id,
-            cell_type,
-            format,
-            content,
-            fabric_id,
-        )
+        self.insert_cell_in_table(CellTable::Data, id, cell_type, format, content, fabric_id)
     }
 
     fn replace_cell(
@@ -390,34 +411,71 @@ impl Storage for MySqlStorage {
         self.close_active_version(id)
     }
 
+    fn get_fabric(&self, id: Uuid) -> Result<FabricRecord> {
+        self.with_conn(|conn| {
+            let row: Option<Row> = conn.exec_first(
+                &format!(
+                    "SELECT id, DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s.%f')
+                     FROM fabric
+                     WHERE id = :id AND valid_from <= {} AND valid_to > {}
+                     ORDER BY valid_from DESC
+                     LIMIT 1",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                params! {"id" => id.to_string()},
+            )?;
+            row.map(Self::fabric_from_row).transpose()?.ok_or(EngineError::NotFound)
+        })
+    }
+
+    fn get_fabric_at(&self, id: Uuid, ts: Timestamp) -> Result<FabricRecord> {
+        self.with_conn(|conn| {
+            let row: Option<Row> = conn.exec_first(
+                "SELECT id, DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s.%f'), DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s.%f')
+                 FROM fabric
+                 WHERE id = :id AND valid_from <= :ts AND valid_to > :ts
+                 ORDER BY valid_from DESC
+                 LIMIT 1",
+                params! {"id" => id.to_string(), "ts" => format_db_time(&ts)},
+            )?;
+            row.map(Self::fabric_from_row).transpose()?.ok_or(EngineError::NotFound)
+        })
+    }
+
+    fn list_fabrics(&self) -> Result<Vec<Uuid>> {
+        self.with_conn(|conn| {
+            let rows: Vec<String> = conn.exec(
+                &format!(
+                    "SELECT id FROM fabric WHERE valid_from <= {} AND valid_to > {} ORDER BY id ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                (),
+            )?;
+            rows.into_iter()
+                .map(|id_str| {
+                    Uuid::parse_str(&id_str)
+                        .map_err(|err| EngineError::InvalidData(format!("invalid fabric UUID in row: {err}")))
+                })
+                .collect()
+        })
+    }
+
     fn get_cell(&self, id: Uuid) -> Result<Cell> {
         MySqlStorage::get_cell(self, id)
     }
 
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
-        if let Some(cell) = self.get_cell_at_from_table(CellTable::Data, id, ts)? {
-            return Ok(cell);
-        }
-
-        if let Some(cell) = self.get_cell_at_from_table(CellTable::Meta, id, ts)? {
-            return Ok(cell);
-        }
-
-        Err(EngineError::NotFound)
+        self.get_cell_at_from_table(CellTable::Data, id, ts)?
+            .ok_or(EngineError::NotFound)
     }
 
     fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
-        let mut rows = self.get_cell_history_from_table(CellTable::Data, id)?;
-        rows.extend(self.get_cell_history_from_table(CellTable::Meta, id)?);
-        rows.sort_by(|a, b| {
-            a.valid_from
-                .cmp(&b.valid_from)
-                .then(a.valid_to.cmp(&b.valid_to))
-        });
-        Ok(rows)
+        self.get_cell_history_from_table(CellTable::Data, id)
     }
 
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
+    fn insert_fabric_cell(&self, fabric_cell: &FabricMemberRow) -> Result<()> {
         self.with_conn(|conn| {
             let relation_type = serde_json::to_string(&fabric_cell.relation_type)?;
 
@@ -428,7 +486,7 @@ impl Storage for MySqlStorage {
                      SET valid_to = {}
                      WHERE fabric_id = :fabric_id
                        AND relation_type = :relation_type
-                       AND ordinal = :ordinal
+                       AND cell_id = :cell_id
                        AND valid_from <= {}
                        AND valid_to > {}",
                         Self::NOW_EXPR,
@@ -438,9 +496,50 @@ impl Storage for MySqlStorage {
                     params! {
                         "fabric_id" => fabric_cell.fabric_id.to_string(),
                         "relation_type" => relation_type.clone(),
-                        "ordinal" => fabric_cell.ordinal,
+                        "cell_id" => fabric_cell.cell_id.to_string(),
                     },
                 )?;
+
+                if let Some(ordinal) = fabric_cell.ordinal {
+                    conn.exec_drop(
+                        &format!(
+                            "UPDATE fabric_cells
+                     SET valid_to = {}
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND ordinal = :ordinal
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR
+                        ),
+                        params! {
+                            "fabric_id" => fabric_cell.fabric_id.to_string(),
+                            "relation_type" => relation_type.clone(),
+                            "ordinal" => ordinal,
+                        },
+                    )?;
+                } else {
+                    conn.exec_drop(
+                        &format!(
+                            "UPDATE fabric_cells
+                     SET valid_to = {}
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND ordinal IS NULL
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR
+                        ),
+                        params! {
+                            "fabric_id" => fabric_cell.fabric_id.to_string(),
+                            "relation_type" => relation_type.clone(),
+                        },
+                    )?;
+                }
 
                 conn.exec_drop(
                     "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal)
@@ -457,13 +556,38 @@ impl Storage for MySqlStorage {
                     "DELETE FROM fabric_cells
                      WHERE fabric_id = :fabric_id
                        AND relation_type = :relation_type
-                       AND ordinal = :ordinal",
+                       AND cell_id = :cell_id",
                     params! {
                         "fabric_id" => fabric_cell.fabric_id.to_string(),
                         "relation_type" => relation_type.clone(),
-                        "ordinal" => fabric_cell.ordinal,
+                        "cell_id" => fabric_cell.cell_id.to_string(),
                     },
                 )?;
+
+                if let Some(ordinal) = fabric_cell.ordinal {
+                    conn.exec_drop(
+                        "DELETE FROM fabric_cells
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND ordinal = :ordinal",
+                        params! {
+                            "fabric_id" => fabric_cell.fabric_id.to_string(),
+                            "relation_type" => relation_type.clone(),
+                            "ordinal" => ordinal,
+                        },
+                    )?;
+                } else {
+                    conn.exec_drop(
+                        "DELETE FROM fabric_cells
+                     WHERE fabric_id = :fabric_id
+                       AND relation_type = :relation_type
+                       AND ordinal IS NULL",
+                        params! {
+                            "fabric_id" => fabric_cell.fabric_id.to_string(),
+                            "relation_type" => relation_type.clone(),
+                        },
+                    )?;
+                }
 
                 conn.exec_drop(
                     "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
@@ -605,21 +729,25 @@ impl Storage for MySqlStorage {
         })
     }
 
-    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricMemberRow>> {
         self.with_conn(|conn| {
-            let rows: Vec<(String, String, String, i64)> = conn.exec(
+            let rows: Vec<(String, String, String, Option<i64>)> = conn.exec(
                 &format!(
                     "SELECT fabric_id, cell_id, relation_type, ordinal
                      FROM fabric_cells
                      WHERE fabric_id = :fabric_id
                        AND valid_from <= {}
                        AND valid_to > {}
-                     ORDER BY relation_type ASC, ordinal ASC",
+                     ORDER BY CASE WHEN relation_type = :root_relation THEN 0 ELSE 1 END,
+                              ordinal IS NULL ASC,
+                              ordinal ASC,
+                              cell_id ASC",
                     Self::NOW_EXPR,
                     Self::NOW_EXPR
                 ),
                 params! {
                     "fabric_id" => fabric_id.to_string(),
+                    "root_relation" => Self::root_relation_value()?,
                 },
             )?;
 
@@ -632,7 +760,7 @@ impl Storage for MySqlStorage {
                     EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
                 })?;
                 let parsed_relation_type = serde_json::from_str(&relation_type_str)?;
-                result.push(FabricCell {
+                result.push(FabricMemberRow {
                     fabric_id: parsed_fabric_id,
                     cell_id: parsed_cell_id,
                     relation_type: parsed_relation_type,
@@ -643,18 +771,22 @@ impl Storage for MySqlStorage {
         })
     }
 
-    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricMemberRow>> {
         self.with_conn(|conn| {
-            let rows: Vec<(String, String, String, i64)> = conn.exec(
+            let rows: Vec<(String, String, String, Option<i64>)> = conn.exec(
                 "SELECT fabric_id, cell_id, relation_type, ordinal
                  FROM fabric_cells
                  WHERE fabric_id = :fabric_id
                    AND valid_from <= :ts
                    AND valid_to > :ts
-                 ORDER BY relation_type ASC, ordinal ASC",
+                 ORDER BY CASE WHEN relation_type = :root_relation THEN 0 ELSE 1 END,
+                          ordinal IS NULL ASC,
+                          ordinal ASC,
+                          cell_id ASC",
                 params! {
                     "fabric_id" => fabric_id.to_string(),
                     "ts" => format_db_time(&ts),
+                    "root_relation" => Self::root_relation_value()?,
                 },
             )?;
 
@@ -668,7 +800,7 @@ impl Storage for MySqlStorage {
                 })?;
                 let parsed_relation_type = serde_json::from_str(&relation_type_str)?;
 
-                result.push(FabricCell {
+                result.push(FabricMemberRow {
                     fabric_id: parsed_fabric_id,
                     cell_id: parsed_cell_id,
                     relation_type: parsed_relation_type,

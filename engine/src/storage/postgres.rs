@@ -17,9 +17,9 @@ use std::sync::Mutex;
 use postgres::{Client, NoTls};
 use uuid::Uuid;
 
-use super::Storage;
+use super::{FabricMemberRow, FabricRecord, Storage};
 use crate::error::{EngineError, Result};
-use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::models::{Cell, CellType, ContentFormat, RelationType, Timestamp};
 use crate::storage::time::{FUTURE_SENTINEL_STR, MIN_TIMESTAMP_STR, format_db_time, parse_db_time};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,10 +30,7 @@ enum CellTable {
 
 impl CellTable {
     fn as_str(self) -> &'static str {
-        match self {
-            Self::Data => "data_cell",
-            Self::Meta => "meta_cell",
-        }
+        "cell"
     }
 }
 
@@ -44,6 +41,10 @@ pub struct PostgresStorage {
 
 impl PostgresStorage {
     const NOW_EXPR: &'static str = "clock_timestamp()";
+
+    fn root_relation_value() -> Result<String> {
+        Ok(serde_json::to_string(&RelationType::Root)?)
+    }
 
     pub fn new(connection_str: &str, temporal_fabric_cells: bool) -> Result<Self> {
         let client = Client::connect(connection_str, NoTls)?;
@@ -70,7 +71,14 @@ impl PostgresStorage {
         self.with_client(|client| {
             client.batch_execute(
                 "
-                CREATE TABLE IF NOT EXISTS data_cell (
+                CREATE TABLE IF NOT EXISTS fabric (
+                    id TEXT NOT NULL,
+                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
+                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
+                    PRIMARY KEY (id, valid_to)
+                );
+
+                CREATE TABLE IF NOT EXISTS cell (
                     id TEXT NOT NULL,
                     cell_type TEXT NOT NULL,
                     format TEXT NOT NULL,
@@ -78,24 +86,6 @@ impl PostgresStorage {
                     valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
                     valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
                     fabric_id TEXT,
-                    PRIMARY KEY (id, valid_to)
-                );
-
-                CREATE TABLE IF NOT EXISTS meta_cell (
-                    id TEXT NOT NULL,
-                    cell_type TEXT NOT NULL,
-                    format TEXT NOT NULL,
-                    content BYTEA NOT NULL,
-                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
-                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
-                    fabric_id TEXT,
-                    PRIMARY KEY (id, valid_to)
-                );
-
-                CREATE TABLE IF NOT EXISTS fabric_cell (
-                    id TEXT NOT NULL,
-                    valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
-                    valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
                     PRIMARY KEY (id, valid_to)
                 );
 
@@ -103,23 +93,30 @@ impl PostgresStorage {
                     fabric_id TEXT NOT NULL,
                     cell_id TEXT NOT NULL,
                     relation_type TEXT NOT NULL,
-                    ordinal BIGINT NOT NULL,
+                    ordinal BIGINT,
                     valid_from TIMESTAMP NOT NULL DEFAULT (clock_timestamp()),
                     valid_to TIMESTAMP NOT NULL DEFAULT TIMESTAMP '2100-01-01 00:00:00',
-                    PRIMARY KEY (fabric_id, relation_type, ordinal, valid_to)
+                    PRIMARY KEY (fabric_id, relation_type, cell_id, valid_to)
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS data_cell_one_active_per_id
-                ON data_cell(id)
+                CREATE UNIQUE INDEX IF NOT EXISTS fabric_one_active_per_id
+                ON fabric(id)
                 WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
 
-                CREATE UNIQUE INDEX IF NOT EXISTS meta_cell_one_active_per_id
-                ON meta_cell(id)
+                CREATE UNIQUE INDEX IF NOT EXISTS cell_one_active_per_id
+                ON cell(id)
                 WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
+
+                CREATE INDEX IF NOT EXISTS cell_current_lookup
+                ON cell(id, valid_from, valid_to);
 
                 CREATE UNIQUE INDEX IF NOT EXISTS fabric_cells_one_active_per_slot
                 ON fabric_cells(fabric_id, relation_type, ordinal)
-                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00';
+                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00' AND ordinal IS NOT NULL;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS fabric_cells_one_active_root
+                ON fabric_cells(fabric_id, relation_type)
+                WHERE valid_to = TIMESTAMP '2100-01-01 00:00:00' AND ordinal IS NULL;
                 ",
             )?;
             Ok(())
@@ -155,22 +152,23 @@ impl PostgresStorage {
                 ],
             )?;
 
-            if fabric_id.is_some() {
+            if let Some(fabric_id) = fabric_id {
+                client.execute("INSERT INTO fabric (id) VALUES ($1)", &[&fabric_id.to_string()])?;
                 client.execute(
-                    "INSERT INTO fabric_cell (id) VALUES ($1)",
-                    &[&id.to_string()],
+                    "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
+                     VALUES ($1, $2, $3, NULL, $4, $5)",
+                    &[
+                        &fabric_id.to_string(),
+                        &id.to_string(),
+                        &Self::root_relation_value()?,
+                        &MIN_TIMESTAMP_STR,
+                        &FUTURE_SENTINEL_STR,
+                    ],
                 )?;
             }
 
             Self::get_current_cell_from_table(client, table, id)?.ok_or(EngineError::NotFound)
         })
-    }
-
-    fn table_for_cell_type(cell_type: &CellType) -> CellTable {
-        match cell_type {
-            CellType::Meta => CellTable::Meta,
-            _ => CellTable::Data,
-        }
     }
 
     fn cell_from_row(row: &postgres::Row) -> Result<Cell> {
@@ -204,6 +202,19 @@ impl PostgresStorage {
             valid_from,
             valid_to,
             fabric_id,
+        })
+    }
+
+    fn fabric_from_row(row: &postgres::Row) -> Result<FabricRecord> {
+        let id_str: String = row.get(0);
+        let valid_from_str: String = row.get(1);
+        let valid_to_str: String = row.get(2);
+        Ok(FabricRecord {
+            id: Uuid::parse_str(&id_str).map_err(|err| {
+                EngineError::InvalidData(format!("invalid fabric UUID in row: {err}"))
+            })?,
+            valid_from: parse_db_time(&valid_from_str)?,
+            valid_to: parse_db_time(&valid_to_str)?,
         })
     }
 
@@ -328,23 +339,31 @@ impl PostgresStorage {
             if changed == 0 {
                 return Err(EngineError::NotFound);
             }
-            client.execute(
-                &format!(
-                    "UPDATE fabric_cell
-                     SET valid_to = {}
-                     WHERE id = $1 AND valid_from <= {} AND valid_to > {}",
-                    Self::NOW_EXPR,
-                    Self::NOW_EXPR,
-                    Self::NOW_EXPR
-                ),
-                &[&id_str],
-            )?;
             Ok(())
         })
     }
 }
 
 impl Storage for PostgresStorage {
+    fn insert_fabric(&self, id: Uuid) -> Result<FabricRecord> {
+        self.with_client(|client| {
+            client.execute("INSERT INTO fabric (id) VALUES ($1)", &[&id.to_string()])?;
+            let row = client.query_one(
+                &format!(
+                    "SELECT id, to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US'), to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US')
+                     FROM fabric
+                     WHERE id = $1 AND valid_from <= {} AND valid_to > {}
+                     ORDER BY valid_from DESC
+                     LIMIT 1",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&id.to_string()],
+            )?;
+            Self::fabric_from_row(&row)
+        })
+    }
+
     fn insert_cell(
         &self,
         id: Uuid,
@@ -353,14 +372,7 @@ impl Storage for PostgresStorage {
         content: &[u8],
         fabric_id: Option<Uuid>,
     ) -> Result<Cell> {
-        self.insert_cell_in_table(
-            Self::table_for_cell_type(cell_type),
-            id,
-            cell_type,
-            format,
-            content,
-            fabric_id,
-        )
+        self.insert_cell_in_table(CellTable::Data, id, cell_type, format, content, fabric_id)
     }
 
     fn replace_cell(
@@ -379,34 +391,76 @@ impl Storage for PostgresStorage {
         self.close_active_version(id)
     }
 
+    fn get_fabric(&self, id: Uuid) -> Result<FabricRecord> {
+        self.with_client(|client| {
+            let row = client.query_opt(
+                &format!(
+                    "SELECT id, to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US'), to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US')
+                     FROM fabric
+                     WHERE id = $1 AND valid_from <= {} AND valid_to > {}
+                     ORDER BY valid_from DESC
+                     LIMIT 1",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[&id.to_string()],
+            )?;
+            row.map(|row| Self::fabric_from_row(&row))
+                .transpose()?
+                .ok_or(EngineError::NotFound)
+        })
+    }
+
+    fn get_fabric_at(&self, id: Uuid, ts: Timestamp) -> Result<FabricRecord> {
+        self.with_client(|client| {
+            let row = client.query_opt(
+                "SELECT id, to_char(valid_from, 'YYYY-MM-DD HH24:MI:SS.US'), to_char(valid_to, 'YYYY-MM-DD HH24:MI:SS.US')
+                 FROM fabric
+                 WHERE id = $1 AND valid_from <= $2 AND valid_to > $2
+                 ORDER BY valid_from DESC
+                 LIMIT 1",
+                &[&id.to_string(), &format_db_time(&ts)],
+            )?;
+            row.map(|row| Self::fabric_from_row(&row))
+                .transpose()?
+                .ok_or(EngineError::NotFound)
+        })
+    }
+
+    fn list_fabrics(&self) -> Result<Vec<Uuid>> {
+        self.with_client(|client| {
+            let rows = client.query(
+                &format!(
+                    "SELECT id FROM fabric WHERE valid_from <= {} AND valid_to > {} ORDER BY id ASC",
+                    Self::NOW_EXPR,
+                    Self::NOW_EXPR
+                ),
+                &[],
+            )?;
+            rows.into_iter()
+                .map(|row| {
+                    let id_str: String = row.get(0);
+                    Uuid::parse_str(&id_str)
+                        .map_err(|err| EngineError::InvalidData(format!("invalid fabric UUID in row: {err}")))
+                })
+                .collect()
+        })
+    }
+
     fn get_cell(&self, id: Uuid) -> Result<Cell> {
         PostgresStorage::get_cell(self, id)
     }
 
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell> {
-        if let Some(cell) = self.get_cell_at_from_table(CellTable::Data, id, ts)? {
-            return Ok(cell);
-        }
-
-        if let Some(cell) = self.get_cell_at_from_table(CellTable::Meta, id, ts)? {
-            return Ok(cell);
-        }
-
-        Err(EngineError::NotFound)
+        self.get_cell_at_from_table(CellTable::Data, id, ts)?
+            .ok_or(EngineError::NotFound)
     }
 
     fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>> {
-        let mut rows = self.get_cell_history_from_table(CellTable::Data, id)?;
-        rows.extend(self.get_cell_history_from_table(CellTable::Meta, id)?);
-        rows.sort_by(|a, b| {
-            a.valid_from
-                .cmp(&b.valid_from)
-                .then(a.valid_to.cmp(&b.valid_to))
-        });
-        Ok(rows)
+        self.get_cell_history_from_table(CellTable::Data, id)
     }
 
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()> {
+    fn insert_fabric_cell(&self, fabric_cell: &FabricMemberRow) -> Result<()> {
         self.with_client(|client| {
             let fabric_id = fabric_cell.fabric_id.to_string();
             let cell_id = fabric_cell.cell_id.to_string();
@@ -419,15 +473,49 @@ impl Storage for PostgresStorage {
                      SET valid_to = {}
                      WHERE fabric_id = $1
                        AND relation_type = $2
-                       AND ordinal = $3
+                       AND cell_id = $3
                        AND valid_from <= {}
                        AND valid_to > {}",
                         Self::NOW_EXPR,
                         Self::NOW_EXPR,
                         Self::NOW_EXPR
                     ),
-                    &[&fabric_id, &relation_type, &fabric_cell.ordinal],
+                    &[&fabric_id, &relation_type, &cell_id],
                 )?;
+
+                if let Some(ordinal) = fabric_cell.ordinal {
+                    client.execute(
+                        &format!(
+                            "UPDATE fabric_cells
+                     SET valid_to = {}
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND ordinal = $3
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR
+                        ),
+                        &[&fabric_id, &relation_type, &ordinal],
+                    )?;
+                } else {
+                    client.execute(
+                        &format!(
+                            "UPDATE fabric_cells
+                     SET valid_to = {}
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND ordinal IS NULL
+                       AND valid_from <= {}
+                       AND valid_to > {}",
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR,
+                            Self::NOW_EXPR
+                        ),
+                        &[&fabric_id, &relation_type],
+                    )?;
+                }
 
                 client.execute(
                     "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal)
@@ -439,9 +527,27 @@ impl Storage for PostgresStorage {
                     "DELETE FROM fabric_cells
                      WHERE fabric_id = $1
                        AND relation_type = $2
-                       AND ordinal = $3",
-                    &[&fabric_id, &relation_type, &fabric_cell.ordinal],
+                       AND cell_id = $3",
+                    &[&fabric_id, &relation_type, &cell_id],
                 )?;
+
+                if let Some(ordinal) = fabric_cell.ordinal {
+                    client.execute(
+                        "DELETE FROM fabric_cells
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND ordinal = $3",
+                        &[&fabric_id, &relation_type, &ordinal],
+                    )?;
+                } else {
+                    client.execute(
+                        "DELETE FROM fabric_cells
+                     WHERE fabric_id = $1
+                       AND relation_type = $2
+                       AND ordinal IS NULL",
+                        &[&fabric_id, &relation_type],
+                    )?;
+                }
 
                 client.execute(
                     "INSERT INTO fabric_cells (fabric_id, cell_id, relation_type, ordinal, valid_from, valid_to)
@@ -572,7 +678,7 @@ impl Storage for PostgresStorage {
         })
     }
 
-    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricMemberRow>> {
         self.with_client(|client| {
             let fabric = fabric_id.to_string();
             let rows = client.query(
@@ -582,11 +688,13 @@ impl Storage for PostgresStorage {
                      WHERE fabric_id = $1
                        AND valid_from <= {}
                        AND valid_to > {}
-                     ORDER BY relation_type ASC, ordinal ASC",
+                     ORDER BY CASE WHEN relation_type = $2 THEN 0 ELSE 1 END,
+                              ordinal ASC NULLS LAST,
+                              cell_id ASC",
                     Self::NOW_EXPR,
                     Self::NOW_EXPR
                 ),
-                &[&fabric],
+                &[&fabric, &Self::root_relation_value()?],
             )?;
 
             let mut result = Vec::with_capacity(rows.len());
@@ -594,7 +702,7 @@ impl Storage for PostgresStorage {
                 let fabric_id_str: String = row.get(0);
                 let cell_id_str: String = row.get(1);
                 let relation_type_str: String = row.get(2);
-                let ordinal: i64 = row.get(3);
+                let ordinal: Option<i64> = row.get(3);
                 let fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
                     EngineError::InvalidData(format!("invalid fabric UUID in fabric_cells: {err}"))
                 })?;
@@ -602,7 +710,7 @@ impl Storage for PostgresStorage {
                     EngineError::InvalidData(format!("invalid cell UUID in fabric_cells: {err}"))
                 })?;
                 let relation_type = serde_json::from_str(&relation_type_str)?;
-                result.push(FabricCell {
+                result.push(FabricMemberRow {
                     fabric_id,
                     cell_id,
                     relation_type,
@@ -613,7 +721,7 @@ impl Storage for PostgresStorage {
         })
     }
 
-    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>> {
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricMemberRow>> {
         self.with_client(|client| {
             let fabric = fabric_id.to_string();
             let rows = client.query(
@@ -622,8 +730,10 @@ impl Storage for PostgresStorage {
                  WHERE fabric_id = $1
                    AND valid_from <= $2
                    AND valid_to > $2
-                 ORDER BY relation_type ASC, ordinal ASC",
-                &[&fabric, &format_db_time(&ts)],
+                 ORDER BY CASE WHEN relation_type = $3 THEN 0 ELSE 1 END,
+                          ordinal ASC NULLS LAST,
+                          cell_id ASC",
+                &[&fabric, &format_db_time(&ts), &Self::root_relation_value()?],
             )?;
 
             let mut result = Vec::with_capacity(rows.len());
@@ -631,7 +741,7 @@ impl Storage for PostgresStorage {
                 let fabric_id_str: String = row.get(0);
                 let cell_id_str: String = row.get(1);
                 let relation_type_str: String = row.get(2);
-                let ordinal: i64 = row.get(3);
+                let ordinal: Option<i64> = row.get(3);
 
                 let fabric_id = Uuid::parse_str(&fabric_id_str).map_err(|err| {
                     EngineError::InvalidData(format!("invalid fabric UUID in fabric_cells: {err}"))
@@ -641,7 +751,7 @@ impl Storage for PostgresStorage {
                 })?;
                 let relation_type = serde_json::from_str(&relation_type_str)?;
 
-                result.push(FabricCell {
+                result.push(FabricMemberRow {
                     fabric_id,
                     cell_id,
                     relation_type,

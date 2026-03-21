@@ -82,6 +82,7 @@ Canonical meaning:
 Logical model:
 
 - `Cell` may reference one `Fabric`
+- `Fabric` has its own stable identifier
 - `Fabric` contains an ordered collection of `Cell`
 - Ordering is part of the logical model
 - Storage implementation for ordering is a data-layer concern
@@ -90,17 +91,19 @@ Logical model:
 Preferred logic-layer wording:
 
 - Use `Cell`, `Fabric`, and `FabricCell`
+- The root/start cell may be represented as a `FabricCell` with a static root relation
+- `Fabric` owns the fabric identifier; `FabricCell` represents membership inside that fabric
 - Do not introduce graph-specific wording such as `Edge` unless the system is explicitly being modeled as a graph engine
 - Do not rename fabric membership into `Edge`, `FabricEdge`, or other graph-oriented terms
 
 Storage model:
 
-- `fabric_cell`: fabric metadata
-- `fabric_cells`: membership and ordering of cells inside a fabric
+- `fabric_cells`: membership and ordering of cells inside a fabric, including the root/start relationship
 
 Storage guidance:
 
 - `fabric_cells` is the data-layer representation of fabric membership and order
+- `fabric_id` belongs to the fabric itself and may remain present in storage rows for membership lookup and constraints
 - Ordering may be stored with ordinal positions, linked-list style pointers, or left/right tree-style indexing
 - Storage strategy must not change the logical meaning of `Fabric` as an ordered collection of `Cell`
 
@@ -142,7 +145,7 @@ Three naming layers must remain distinct:
 
 - Engine layer: `Cell`, `Fabric`, `FabricCell`
 - API/application layer: `Document`
-- Data layer: storage-oriented names such as `data_cell`, `meta_cell`, `fabric_cell`, `fabric_cells`
+- Data layer: storage-oriented names such as `fabric`, `cell`, `fabric_cells`
 
 Rules:
 
@@ -267,15 +270,15 @@ Responsibility split for temporal handling:
 
 Core tables:
 
-- `data_cell`
-- `meta_cell`
-- `fabric_cell`
+- `fabric`
+- `cell`
 - `fabric_cells`
 
 Notes:
 
 - Cell tables are temporal
 - `fabric_cells` stores fabric membership and ordering
+- When temporal fabric membership is enabled, membership and ordering history are preserved in `fabric_cells`
 - Ordering may be implemented with ordinal position, linked-list style pointers, or tree-style indexing
 - Storage strategy must not change the logical meaning of `Fabric` as an ordered collection of cells
 - Temporal defaults and current-time evaluation belong to the database layer
@@ -345,8 +348,8 @@ Expected engine methods:
 
 - `get_cell(id)`
 - `get_cell_at(id, timestamp)`
-- `build_context(fabric_id)`
-- `build_context_at_time(fabric_id, timestamp)`
+- `build_fabric(fabric_id)`
+- `build_fabric_at_time(fabric_id, timestamp)`
 
 ## Sync Strategy (Future Phase)
 

@@ -200,26 +200,26 @@ fn generates_and_roundtrips_large_use_case_documents() {
 
     for (seed, doc) in &stored {
         let fetch_start = Instant::now();
-        let context = engine.build_context(doc.root_id).unwrap();
+        let fabric = engine.build_fabric(doc.root_id).unwrap();
         let fetch_ms = fetch_start.elapsed().as_millis();
 
-        let contains = context
-            .fabric_cells
+        let contains = fabric
+            .cells
             .iter()
             .filter(|e| e.relation_type == RelationType::Contains)
             .count();
-        let references = context
-            .fabric_cells
+        let references = fabric
+            .cells
             .iter()
             .filter(|e| e.relation_type == RelationType::References)
             .count();
 
-        let stored_words: usize = context
+        let stored_words: usize = fabric
             .cells
             .iter()
-            .filter(|c| c.cell_type == CellType::Data)
-            .map(|c| {
-                String::from_utf8_lossy(&c.content)
+            .filter(|entry| entry.cell.cell_type == CellType::Data)
+            .map(|entry| {
+                String::from_utf8_lossy(&entry.cell.content)
                     .split_whitespace()
                     .count()
             })

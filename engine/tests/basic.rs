@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
+use rusqlite::Connection;
 
-use mnemonic_engine::{
-    CellType, ConflictStrategy, ContentFormat, Engine, EngineConfig, RelationType, Timestamp,
-    VersionCandidate,
-};
+use mnemonic_engine::{CellType, ContentFormat, Engine, EngineConfig, RelationType, Timestamp};
 
 // Black-box specification baseline derived from AGENTS.md.
 const SPEC_RULES: &[&str] = &[
@@ -25,8 +23,7 @@ const SPEC_RULES: &[&str] = &[
     "Temporal validity window is valid_from <= T < valid_to",
     "Update algorithm: close active row, then insert new active row",
     "Current reads are time-window based, not hard-coded to a sentinel",
-    "Fabric context reconstruction is deterministic at any timestamp",
-    "Conflicts are resolved before promoting a new active version",
+    "Fabric reconstruction is deterministic at any timestamp",
 ];
 
 fn now_ts() -> Timestamp {
@@ -35,7 +32,7 @@ fn now_ts() -> Timestamp {
 
 #[test]
 fn spec_sanity_rules_exist() {
-    assert_eq!(SPEC_RULES.len(), 6);
+    assert_eq!(SPEC_RULES.len(), 5);
 }
 
 #[test]
@@ -77,40 +74,6 @@ fn spec_temporal_window_boundary_on_update() {
 }
 
 #[test]
-fn spec_conflict_resolution_deterministic() {
-    let engine = Engine::new(":memory:").unwrap();
-    let cell = engine
-        .create_cell(CellType::Raw, ContentFormat::Text, b"base".to_vec())
-        .unwrap();
-
-    let local = VersionCandidate {
-        content: b"local".to_vec(),
-        timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-        logical_clock: Some(3),
-    };
-    let remote = VersionCandidate {
-        content: b"remote".to_vec(),
-        timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
-        logical_clock: Some(2),
-    };
-
-    let lww = engine
-        .resolve_conflict_and_update(
-            cell.id,
-            local.clone(),
-            remote.clone(),
-            ConflictStrategy::LastWriteWins,
-        )
-        .unwrap();
-    assert_eq!(lww.content, b"remote".to_vec());
-
-    let logical = engine
-        .resolve_conflict_and_update(cell.id, local, remote, ConflictStrategy::LogicalClock)
-        .unwrap();
-    assert_eq!(logical.content, b"local".to_vec());
-}
-
-#[test]
 fn spec_temporal_fabric_cells_when_enabled() {
     let engine = Engine::with_config(
         ":memory:",
@@ -143,22 +106,128 @@ fn spec_temporal_fabric_cells_when_enabled() {
         .unwrap();
 
     let historical = engine
-        .build_context_at_time(parent.id, t_before_switch)
+        .build_fabric_at_time(parent.id, t_before_switch)
         .unwrap();
+    assert_eq!(historical.id, parent.fabric_id.unwrap());
     assert!(
         historical
-            .fabric_cells
+            .cells
             .iter()
-            .any(|entry| entry.cell_id == first.id)
+            .any(|entry| entry.cell.id == first.id && entry.ordinal == Some(0))
     );
 
-    let current = engine.build_context(parent.id).unwrap();
+    let current = engine.build_fabric(parent.id).unwrap();
+    assert_eq!(current.id, parent.fabric_id.unwrap());
     assert!(
         current
-            .fabric_cells
+            .cells
             .iter()
-            .any(|entry| entry.cell_id == second.id)
+            .any(|entry| entry.cell.id == second.id && entry.ordinal == Some(0))
     );
+}
+
+#[test]
+fn temporal_fabric_order_history_preserves_previous_ordinals() {
+    let engine = Engine::with_config(
+        ":memory:",
+        EngineConfig {
+            temporal_fabric_cells: true,
+        },
+    )
+    .unwrap();
+
+    let parent = engine
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+    let first = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"first".to_vec())
+        .unwrap();
+    let second = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"second".to_vec())
+        .unwrap();
+
+    engine
+        .add_fabric_cell(parent.id, first.id, RelationType::Contains, Some(0))
+        .unwrap();
+    engine
+        .add_fabric_cell(parent.id, second.id, RelationType::Contains, Some(1))
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let before_reorder = now_ts();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    engine
+        .add_fabric_cell(parent.id, first.id, RelationType::Contains, Some(1))
+        .unwrap();
+
+    let historical = engine
+        .build_fabric_at_time(parent.id, before_reorder)
+        .unwrap();
+    let current = engine.build_fabric(parent.id).unwrap();
+
+    let historical_first = historical
+        .cells
+        .iter()
+        .find(|entry| entry.cell.id == first.id && entry.relation_type == RelationType::Contains)
+        .unwrap();
+    let current_first = current
+        .cells
+        .iter()
+        .find(|entry| entry.cell.id == first.id && entry.relation_type == RelationType::Contains)
+        .unwrap();
+
+    assert_eq!(historical_first.ordinal, Some(0));
+    assert_eq!(current_first.ordinal, Some(1));
+}
+
+#[test]
+fn non_temporal_fabric_membership_only_guarantees_current_order() {
+    let engine = Engine::new(":memory:").unwrap();
+
+    let parent = engine
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+    let first = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"first".to_vec())
+        .unwrap();
+    let second = engine
+        .create_cell(CellType::Raw, ContentFormat::Text, b"second".to_vec())
+        .unwrap();
+
+    engine
+        .add_fabric_cell(parent.id, first.id, RelationType::Contains, Some(0))
+        .unwrap();
+    engine
+        .add_fabric_cell(parent.id, second.id, RelationType::Contains, Some(1))
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let before_reorder = now_ts();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    engine
+        .add_fabric_cell(parent.id, first.id, RelationType::Contains, Some(1))
+        .unwrap();
+
+    let historical = engine
+        .build_fabric_at_time(parent.id, before_reorder)
+        .unwrap();
+    let current = engine.build_fabric(parent.id).unwrap();
+
+    let historical_first = historical
+        .cells
+        .iter()
+        .find(|entry| entry.cell.id == first.id && entry.relation_type == RelationType::Contains)
+        .unwrap();
+    let current_first = current
+        .cells
+        .iter()
+        .find(|entry| entry.cell.id == first.id && entry.relation_type == RelationType::Contains)
+        .unwrap();
+
+    assert_eq!(historical_first.ordinal, current_first.ordinal);
+    assert_eq!(current_first.ordinal, Some(1));
 }
 
 #[test]
@@ -206,10 +275,23 @@ fn e2e_lifecycle_black_box_acceptance() {
     assert_eq!(current_raw.content, b"Updated content".to_vec());
     assert_eq!(historical_raw.content, b"Hello world!".to_vec());
 
-    let context_now = engine.build_context(container.id).unwrap();
-    assert_eq!(context_now.root.id, container.id);
-    assert!(context_now.cells.iter().any(|c| c.id == raw.id));
-    assert!(context_now.cells.iter().any(|c| c.id == digested.id));
+    let fabric_now = engine.build_fabric(container.id).unwrap();
+    assert_eq!(fabric_now.id, container.fabric_id.unwrap());
+    assert!(fabric_now.cells.iter().any(|entry| {
+        entry.relation_type == RelationType::Root
+            && entry.ordinal.is_none()
+            && entry.cell.id == container.id
+    }));
+    assert!(fabric_now.cells.iter().any(|entry| entry.cell.id == raw.id));
+    assert!(
+        fabric_now
+            .cells
+            .iter()
+            .any(|entry| entry.cell.id == digested.id)
+    );
+    let mut expected = vec![container.fabric_id.unwrap(), digested.fabric_id.unwrap()];
+    expected.sort();
+    assert_eq!(engine.list_fabrics().unwrap(), expected);
 }
 
 #[test]
@@ -318,4 +400,81 @@ fn adding_fabric_members_requires_a_fabric_backed_owner_cell() {
         .unwrap_err();
 
     assert!(matches!(err, mnemonic_engine::EngineError::InvalidData(_)));
+}
+
+#[test]
+fn sqlite_schema_uses_datetime_and_nullable_ordinals() {
+    let db_path =
+        std::env::temp_dir().join(format!("mnemonic_schema_{}.sqlite", uuid::Uuid::now_v7()));
+    let engine = Engine::new(db_path.to_str().unwrap()).unwrap();
+    drop(engine);
+
+    let conn = Connection::open(&db_path).unwrap();
+
+    let active_fabrics = Engine::new(db_path.to_str().unwrap())
+        .unwrap()
+        .list_fabrics()
+        .unwrap_or_default();
+    assert!(active_fabrics.is_empty());
+
+    let mut table_stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC")
+        .unwrap();
+    let tables = table_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(tables.iter().any(|name| name == "fabric"));
+    assert!(tables.iter().any(|name| name == "cell"));
+    assert!(!tables.iter().any(|name| name == "data_cell"));
+    assert!(!tables.iter().any(|name| name == "meta_cell"));
+
+    let mut stmt = conn.prepare("PRAGMA table_info('fabric_cells')").unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(rows.iter().any(|(name, ty, notnull)| {
+        name == "ordinal" && ty.eq_ignore_ascii_case("INTEGER") && *notnull == 0
+    }));
+    assert!(
+        rows.iter()
+            .any(|(name, ty, _)| { name == "valid_from" && ty.eq_ignore_ascii_case("DATETIME") })
+    );
+    assert!(
+        rows.iter()
+            .any(|(name, ty, _)| { name == "valid_to" && ty.eq_ignore_ascii_case("DATETIME") })
+    );
+
+    std::fs::remove_file(db_path).unwrap();
+}
+
+#[test]
+fn listing_fabrics_reads_from_dedicated_fabric_table() {
+    let db_path =
+        std::env::temp_dir().join(format!("mnemonic_fabrics_{}.sqlite", uuid::Uuid::now_v7()));
+    let engine = Engine::new(db_path.to_str().unwrap()).unwrap();
+
+    let first = engine
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+    let second = engine
+        .create_cell_with_fabric(CellType::Container, ContentFormat::Json, vec![])
+        .unwrap();
+
+    let mut expected = vec![first.fabric_id.unwrap(), second.fabric_id.unwrap()];
+    expected.sort();
+    assert_eq!(engine.list_fabrics().unwrap(), expected);
+
+    drop(engine);
+    std::fs::remove_file(db_path).unwrap();
 }

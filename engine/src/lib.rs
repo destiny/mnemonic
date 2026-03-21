@@ -22,10 +22,7 @@ pub mod storage;
 pub use document::{Document, DocumentKind};
 pub use engine::{DocumentContext, Engine, EngineConfig};
 pub use error::{EngineError, Result};
-pub use models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricCell, FabricContext, RelationType,
-    Timestamp, VersionCandidate,
-};
+pub use models::{Cell, CellType, ContentFormat, Fabric, FabricCell, RelationType, Timestamp};
 pub use service::context::ServiceContext;
 pub use service::{DictionaryEntryInput, Service, ServiceApi};
 pub use storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};

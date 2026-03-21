@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_03
 document_type=academic_paper
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-ee8b-73c3-b923-81678c3fe5e6
-purpose_id=019cdd4a-ee8c-7ba2-9535-ce3015146bac
+root_id=019d0e53-b1b7-7a81-846b-042853d80d90
+purpose_id=019d0e53-b1b9-7841-b955-2325e19070b4
 section_count=6
 reference_count=60
 tag_count=7
 target_words=10000
 actual_words=10000
-active_data_rows=41 active_meta_rows=153 active_edge_rows=191
+active_fabric_rows=3 active_cell_rows=194 active_edge_rows=194
 
 Extracted repeated terms:
 - error bounds: 42

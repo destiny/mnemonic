@@ -15,7 +15,7 @@
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::models::{Cell, CellType, ContentFormat, FabricCell, RelationType, Timestamp};
+use crate::models::{Cell, CellType, ContentFormat, RelationType, Timestamp};
 
 pub mod mariadb;
 pub mod mysql;
@@ -28,7 +28,25 @@ pub use mysql::MySqlStorage;
 pub use postgres::PostgresStorage;
 pub use sqlite::SqliteStorage;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct FabricRecord {
+    pub id: Uuid,
+    pub valid_from: Timestamp,
+    pub valid_to: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct FabricMemberRow {
+    pub fabric_id: Uuid,
+    pub cell_id: Uuid,
+    pub relation_type: RelationType,
+    pub ordinal: Option<i64>,
+}
+
 pub trait Storage: Send + Sync {
+    fn insert_fabric(&self, id: Uuid) -> Result<FabricRecord>;
     fn insert_cell(
         &self,
         id: Uuid,
@@ -46,10 +64,13 @@ pub trait Storage: Send + Sync {
         fabric_id: Option<Uuid>,
     ) -> Result<Cell>;
     fn delete_cell(&self, id: Uuid) -> Result<()>;
+    fn get_fabric(&self, id: Uuid) -> Result<FabricRecord>;
+    fn get_fabric_at(&self, id: Uuid, ts: Timestamp) -> Result<FabricRecord>;
+    fn list_fabrics(&self) -> Result<Vec<Uuid>>;
     fn get_cell(&self, id: Uuid) -> Result<Cell>;
     fn get_cell_at(&self, id: Uuid, ts: Timestamp) -> Result<Cell>;
     fn get_cell_history(&self, id: Uuid) -> Result<Vec<Cell>>;
-    fn insert_fabric_cell(&self, fabric_cell: &FabricCell) -> Result<()>;
+    fn insert_fabric_cell(&self, fabric_cell: &FabricMemberRow) -> Result<()>;
     fn next_relation_ordinal(&self, fabric_id: Uuid, relation_type: &RelationType) -> Result<i64>;
     fn next_relation_ordinal_at(
         &self,
@@ -68,6 +89,6 @@ pub trait Storage: Send + Sync {
         relation_type: &RelationType,
         ts: Timestamp,
     ) -> Result<Vec<Uuid>>;
-    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricCell>>;
-    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricCell>>;
+    fn get_fabric_cells(&self, fabric_id: Uuid) -> Result<Vec<FabricMemberRow>>;
+    fn get_fabric_cells_at(&self, fabric_id: Uuid, ts: Timestamp) -> Result<Vec<FabricMemberRow>>;
 }

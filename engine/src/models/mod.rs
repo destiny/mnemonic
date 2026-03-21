@@ -14,8 +14,6 @@
 
 pub mod cell;
 pub mod fabric;
-pub mod version;
 
 pub use cell::{Cell, CellType, ContentFormat, Timestamp};
-pub use fabric::{FabricCell, FabricContext, RelationType};
-pub use version::{ConflictStrategy, VersionCandidate};
+pub use fabric::{Fabric, FabricCell, RelationType};
