@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RelationType {
+    Root,
     Contains,
     References,
     DerivesFrom,
@@ -26,15 +27,13 @@ pub enum RelationType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FabricCell {
-    pub fabric_id: Uuid,
-    pub cell_id: Uuid,
+    pub cell: Cell,
     pub relation_type: RelationType,
-    pub ordinal: i64,
+    pub ordinal: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FabricContext {
-    pub root: Cell,
-    pub fabric_cells: Vec<FabricCell>,
-    pub cells: Vec<Cell>,
+pub struct Fabric {
+    pub id: Uuid,
+    pub cells: Vec<FabricCell>,
 }

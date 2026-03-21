@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_07
 document_type=translation_workspace
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-f048-7a40-9c22-1658859e0a00
-purpose_id=019cdd4a-f049-7703-9613-a261ed62d053
+root_id=019d0e53-b365-7200-ab38-84ef27bc4936
+purpose_id=019d0e53-b367-7f70-b1cf-eaa63db8dad6
 section_count=6
 reference_count=120
 tag_count=7
 target_words=30000
 actual_words=30000
-active_data_rows=96 active_meta_rows=397 active_edge_rows=486
+active_fabric_rows=7 active_cell_rows=493 active_edge_rows=493
 
 Extracted repeated terms:
 - term consistency: 161

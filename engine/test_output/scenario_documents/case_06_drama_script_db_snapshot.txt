@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_06
 document_type=drama_script
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-effe-7502-aadc-05964f6b9383
-purpose_id=019cdd4a-f000-71f1-a6ef-a8cb81f9c915
+root_id=019d0e53-b320-79d3-85b6-8b69f7dc7a2b
+purpose_id=019d0e53-b321-7160-b12b-d2dad181bd84
 section_count=6
 reference_count=20
 tag_count=6
 target_words=25000
 actual_words=25000
-active_data_rows=82 active_meta_rows=276 active_edge_rows=352
+active_fabric_rows=6 active_cell_rows=358 active_edge_rows=358
 
 Extracted repeated terms:
 - Elena: 144

@@ -18,11 +18,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 use crate::error::{EngineError, Result};
-use crate::models::{
-    Cell, CellType, ConflictStrategy, ContentFormat, FabricCell, FabricContext, RelationType,
-    Timestamp, VersionCandidate,
+use crate::models::{Cell, CellType, ContentFormat, Fabric, FabricCell, RelationType, Timestamp};
+use crate::storage::{
+    FabricMemberRow, MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage,
 };
-use crate::storage::{MariaDbStorage, MySqlStorage, PostgresStorage, SqliteStorage, Storage};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EngineConfig {
@@ -39,7 +38,7 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     storage: Box<dyn Storage>,
-    context_cache: RefCell<HashMap<Uuid, FabricContext>>,
+    fabric_cache: RefCell<HashMap<Uuid, Fabric>>,
 }
 
 pub struct DocumentContext<'a> {
@@ -80,7 +79,7 @@ impl<'a> DocumentContext<'a> {
         }
 
         self.dirty_cells.clear();
-        self.engine.refresh_context_cache(self.root_id)?;
+        self.engine.refresh_fabric_cache(self.root_id)?;
         Ok(())
     }
 }
@@ -94,14 +93,14 @@ impl Engine {
         let storage = SqliteStorage::new(db_path, config.temporal_fabric_cells)?;
         Ok(Self {
             storage: Box::new(storage),
-            context_cache: RefCell::new(HashMap::new()),
+            fabric_cache: RefCell::new(HashMap::new()),
         })
     }
 
     pub fn from_storage(storage: Box<dyn Storage>) -> Self {
         Self {
             storage,
-            context_cache: RefCell::new(HashMap::new()),
+            fabric_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -109,7 +108,7 @@ impl Engine {
         let storage = PostgresStorage::new(connection_str, config.temporal_fabric_cells)?;
         Ok(Self {
             storage: Box::new(storage),
-            context_cache: RefCell::new(HashMap::new()),
+            fabric_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -117,7 +116,7 @@ impl Engine {
         let storage = MySqlStorage::new(connection_str, config.temporal_fabric_cells)?;
         Ok(Self {
             storage: Box::new(storage),
-            context_cache: RefCell::new(HashMap::new()),
+            fabric_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -125,17 +124,17 @@ impl Engine {
         let storage = MariaDbStorage::new(connection_str, config.temporal_fabric_cells)?;
         Ok(Self {
             storage: Box::new(storage),
-            context_cache: RefCell::new(HashMap::new()),
+            fabric_cache: RefCell::new(HashMap::new()),
         })
     }
 
-    fn clear_context_cache(&self) {
-        self.context_cache.borrow_mut().clear();
+    fn clear_fabric_cache(&self) {
+        self.fabric_cache.borrow_mut().clear();
     }
 
-    fn refresh_context_cache(&self, fabric_id: Uuid) -> Result<()> {
-        let context = self.build_context_for_timestamp(fabric_id, None)?;
-        self.context_cache.borrow_mut().insert(fabric_id, context);
+    fn refresh_fabric_cache(&self, fabric_id: Uuid) -> Result<()> {
+        let fabric = self.build_fabric_for_timestamp(fabric_id, None)?;
+        self.fabric_cache.borrow_mut().insert(fabric_id, fabric);
         Ok(())
     }
 
@@ -158,7 +157,7 @@ impl Engine {
         let cell = self
             .storage
             .insert_cell(id, &cell_type, &format, &content, None)?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
 
         Ok(cell)
     }
@@ -173,7 +172,7 @@ impl Engine {
         let cell = self
             .storage
             .insert_cell(id, &cell_type, &format, &content, Some(id))?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
 
         Ok(cell)
     }
@@ -187,57 +186,7 @@ impl Engine {
             &new_content,
             cell.fabric_id,
         )?;
-        self.clear_context_cache();
-
-        Ok(cell)
-    }
-
-    pub fn resolve_conflict_and_update(
-        &self,
-        cell_id: Uuid,
-        local: VersionCandidate,
-        remote: VersionCandidate,
-        strategy: ConflictStrategy,
-    ) -> Result<Cell> {
-        let cell = self.get_cell(cell_id)?;
-
-        let winner = match strategy {
-            ConflictStrategy::LastWriteWins => {
-                if local.timestamp >= remote.timestamp {
-                    local
-                } else {
-                    remote
-                }
-            }
-            ConflictStrategy::LogicalClock => {
-                let local_clock = local.logical_clock.unwrap_or(0);
-                let remote_clock = remote.logical_clock.unwrap_or(0);
-                if local_clock > remote_clock {
-                    local
-                } else if remote_clock > local_clock {
-                    remote
-                } else if local.timestamp >= remote.timestamp {
-                    local
-                } else {
-                    remote
-                }
-            }
-        };
-
-        if winner.content.is_empty() {
-            return Err(EngineError::Conflict(
-                "resolved winner has empty content".to_string(),
-            ));
-        }
-
-        let cell = self.storage.replace_cell(
-            cell.id,
-            &cell.cell_type,
-            &cell.format,
-            &winner.content,
-            cell.fabric_id,
-        )?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
 
         Ok(cell)
     }
@@ -257,15 +206,15 @@ impl Engine {
                 .next_relation_ordinal(fabric_id, &relation_type)?,
         };
 
-        let fabric_cell = FabricCell {
+        let fabric_cell = FabricMemberRow {
             fabric_id,
             cell_id,
             relation_type,
-            ordinal: resolved_ordinal,
+            ordinal: Some(resolved_ordinal),
         };
 
         self.storage.insert_fabric_cell(&fabric_cell)?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
 
         Ok(())
     }
@@ -297,7 +246,7 @@ impl Engine {
             &cell.content,
             cell.fabric_id,
         )?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
 
         Ok(next)
     }
@@ -307,15 +256,15 @@ impl Engine {
         root_cell_id: Uuid,
         timestamp: Option<Timestamp>,
     ) -> Result<DocumentContext<'_>> {
-        let context = self.build_context_for_timestamp(root_cell_id, timestamp)?;
+        let fabric = self.build_fabric_for_timestamp(root_cell_id, timestamp)?;
         let mut cells = HashMap::new();
-        for cell in context.cells {
-            cells.insert(cell.id, cell);
+        for fabric_cell in fabric.cells {
+            cells.insert(fabric_cell.cell.id, fabric_cell.cell);
         }
 
         Ok(DocumentContext {
             engine: self,
-            root_id: context.root.id,
+            root_id: root_cell_id,
             cells,
             dirty_cells: HashSet::new(),
         })
@@ -323,6 +272,10 @@ impl Engine {
 
     pub fn get_cell(&self, id: Uuid) -> Result<Cell> {
         self.storage.get_cell(id)
+    }
+
+    pub fn list_fabrics(&self) -> Result<Vec<Uuid>> {
+        self.storage.list_fabrics()
     }
 
     pub fn get_cell_at(&self, id: Uuid, timestamp: Timestamp) -> Result<Cell> {
@@ -335,29 +288,25 @@ impl Engine {
 
     pub fn delete_cell(&self, id: Uuid) -> Result<()> {
         self.storage.delete_cell(id)?;
-        self.clear_context_cache();
+        self.clear_fabric_cache();
         Ok(())
     }
 
-    pub fn build_context(&self, root_cell_id: Uuid) -> Result<FabricContext> {
-        self.build_context_for_timestamp(root_cell_id, None)
+    pub fn build_fabric(&self, root_cell_id: Uuid) -> Result<Fabric> {
+        self.build_fabric_for_timestamp(root_cell_id, None)
     }
 
-    pub fn build_context_at_time(
-        &self,
-        root_cell_id: Uuid,
-        timestamp: Timestamp,
-    ) -> Result<FabricContext> {
-        self.build_context_for_timestamp(root_cell_id, Some(timestamp))
+    pub fn build_fabric_at_time(&self, root_cell_id: Uuid, timestamp: Timestamp) -> Result<Fabric> {
+        self.build_fabric_for_timestamp(root_cell_id, Some(timestamp))
     }
 
-    fn build_context_for_timestamp(
+    fn build_fabric_for_timestamp(
         &self,
         root_cell_id: Uuid,
         timestamp: Option<Timestamp>,
-    ) -> Result<FabricContext> {
+    ) -> Result<Fabric> {
         if timestamp.is_none() {
-            if let Some(cached) = self.context_cache.borrow().get(&root_cell_id).cloned() {
+            if let Some(cached) = self.fabric_cache.borrow().get(&root_cell_id).cloned() {
                 return Ok(cached);
             }
         }
@@ -366,14 +315,25 @@ impl Engine {
             Some(value) => self.get_cell_at(root_cell_id, value)?,
             None => self.get_cell(root_cell_id)?,
         };
+        let fabric_id = root.fabric_id.ok_or_else(|| {
+            EngineError::InvalidData(format!(
+                "cell {root_cell_id} does not reference a fabric; build_fabric requires a fabric-backed root cell"
+            ))
+        })?;
+        match timestamp {
+            Some(value) => {
+                self.storage.get_fabric_at(fabric_id, value)?;
+            }
+            None => {
+                self.storage.get_fabric(fabric_id)?;
+            }
+        }
 
         let mut seen: HashSet<Uuid> = HashSet::new();
         let mut queue = VecDeque::new();
         let mut fabric_cells = Vec::new();
-        let mut cells = Vec::new();
 
         seen.insert(root.id);
-        cells.push(root.clone());
         queue.push_back(root.id);
 
         while let Some(cell_id) = queue.pop_front() {
@@ -390,29 +350,38 @@ impl Engine {
                 None => self.storage.get_fabric_cells(fabric_id)?,
             };
             for fabric_cell in current_fabric_cells {
+                let resolved = match timestamp {
+                    Some(value) => self.get_cell_at(fabric_cell.cell_id, value)?,
+                    None => self.get_cell(fabric_cell.cell_id)?,
+                };
+
                 if seen.insert(fabric_cell.cell_id) {
                     let child = match timestamp {
                         Some(value) => self.get_cell_at(fabric_cell.cell_id, value)?,
                         None => self.get_cell(fabric_cell.cell_id)?,
                     };
-                    cells.push(child);
-                    queue.push_back(fabric_cell.cell_id);
+                    if child.fabric_id.is_some() {
+                        queue.push_back(fabric_cell.cell_id);
+                    }
                 }
-                fabric_cells.push(fabric_cell);
+                fabric_cells.push(FabricCell {
+                    cell: resolved,
+                    relation_type: fabric_cell.relation_type,
+                    ordinal: fabric_cell.ordinal,
+                });
             }
         }
 
-        let context = FabricContext {
-            root,
-            fabric_cells,
-            cells,
+        let fabric = Fabric {
+            id: fabric_id,
+            cells: fabric_cells,
         };
         if timestamp.is_none() {
-            self.context_cache
+            self.fabric_cache
                 .borrow_mut()
-                .insert(root_cell_id, context.clone());
+                .insert(root_cell_id, fabric.clone());
         }
 
-        Ok(context)
+        Ok(fabric)
     }
 }

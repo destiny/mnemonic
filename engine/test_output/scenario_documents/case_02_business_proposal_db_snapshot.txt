@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_02
 document_type=business_proposal
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-ee38-7863-b4c5-d215cebaf745
-purpose_id=019cdd4a-ee39-7243-bb86-bdd7b9ca86ad
+root_id=019d0e53-b16f-7970-b6de-41db34ed826d
+purpose_id=019d0e53-b170-7d01-aadb-3ad1c6b4b8da
 section_count=5
 reference_count=50
 tag_count=7
 target_words=10000
 actual_words=10000
-active_data_rows=27 active_meta_rows=92 active_edge_rows=117
+active_fabric_rows=2 active_cell_rows=119 active_edge_rows=119
 
 Extracted repeated terms:
 - payback period: 50

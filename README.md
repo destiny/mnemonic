@@ -33,6 +33,7 @@ This keeps the public model document-first without replacing the engine primitiv
 
 `Fabric` is the engine-layer structure concept.
 
+- A `Fabric` has a stable identifier
 - A `Fabric` is built from cells
 - A `Fabric` contains cells
 - A `Fabric` preserves order among its member cells
@@ -43,8 +44,11 @@ The ordering behavior is part of the logical model even though the persistence s
 
 `FabricCell` is the engine-layer representation of membership inside a fabric.
 
+- The root/start cell is represented as a `FabricCell` with a root relation
+- Ordered members use an ordinal; static/root membership leaves ordinal empty
+- The public `FabricCell` describes membership and the resolved member `Cell`; the `Fabric` owns the fabric id
 - In engine logic, use `FabricCell`
-- In storage, use `fabric_cells`
+- In storage, use `fabric` for fabric identity, `cell` for cell history, and `fabric_cells` for membership/order
 - Do not replace this with graph language such as `edge`
 
 ## Layer Responsibilities
@@ -72,7 +76,8 @@ The engine should not own database timestamp mechanics directly.
 
 The storage layer owns persistence behavior.
 
-- map logical records to tables such as `data_cell`, `meta_cell`, `fabric_cell`, and `fabric_cells`
+- map logical records to tables such as `data_cell`, `meta_cell`, and `fabric_cells`
+- map logical records to tables such as `fabric`, `cell`, and `fabric_cells`
 - own temporal defaults and validity-window filtering
 - close active rows and materialize replacement rows
 - preserve append-only history and current-state lookup behavior
@@ -109,6 +114,8 @@ The storage layer may represent that order in different ways:
 - tree or indexed ordering strategies
 
 These are storage choices only. They must not change the logical meaning of `Fabric` as an ordered collection of `Cell`.
+
+When temporal fabric membership is enabled, membership and order history are preserved in `fabric_cells`; when it is disabled, only current membership and order are guaranteed.
 
 ## Tradeoffs
 

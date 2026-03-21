@@ -867,18 +867,14 @@ fn store_scenario_into_engine(
 
 fn get_active_content(conn: &Connection, id: Uuid) -> String {
     let now = now_ts();
-    let sql = "
-        SELECT content FROM data_cell
-        WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2
-        UNION ALL
-        SELECT content FROM meta_cell
-        WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2
-        LIMIT 1
-    ";
     let bytes: Vec<u8> = conn
-        .query_row(sql, params![id.to_string(), format_db_time(&now)], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT content FROM cell
+             WHERE id = ?1 AND valid_from <= ?2 AND valid_to > ?2
+             LIMIT 1",
+            params![id.to_string(), format_db_time(&now)],
+            |row| row.get(0),
+        )
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -978,16 +974,16 @@ fn write_db_snapshot(
 ) {
     let conn = Connection::open(db_path).unwrap();
     let now = now_ts();
-    let active_data_count: i64 = conn
+    let active_fabric_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM data_cell WHERE valid_from <= ?1 AND valid_to > ?1",
+            "SELECT COUNT(*) FROM fabric WHERE valid_from <= ?1 AND valid_to > ?1",
             params![format_db_time(&now)],
             |row| row.get(0),
         )
         .unwrap();
-    let active_meta_count: i64 = conn
+    let active_cell_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM meta_cell WHERE valid_from <= ?1 AND valid_to > ?1",
+            "SELECT COUNT(*) FROM cell WHERE valid_from <= ?1 AND valid_to > ?1",
             params![format_db_time(&now)],
             |row| row.get(0),
         )
@@ -1016,8 +1012,8 @@ fn write_db_snapshot(
         word_count(&generated.sections.join(" "))
     ));
     snapshot.push_str(&format!(
-        "active_data_rows={} active_meta_rows={} active_edge_rows={}\n",
-        active_data_count, active_meta_count, active_edge_count
+        "active_fabric_rows={} active_cell_rows={} active_edge_rows={}\n",
+        active_fabric_count, active_cell_count, active_edge_count
     ));
     snapshot.push_str("\nExtracted repeated terms:\n");
     for (term, count) in &generated.tags_with_counts {

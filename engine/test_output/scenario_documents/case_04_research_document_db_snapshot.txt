@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_04
 document_type=research_document
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-eee1-7d71-b056-f61d10ebeed5
-purpose_id=019cdd4a-eee2-7cc1-9ec6-7f535e28e306
+root_id=019d0e53-b208-7121-a6dd-e53061e47cad
+purpose_id=019d0e53-b20a-7250-8482-6fde7bea16e7
 section_count=6
 reference_count=80
 tag_count=7
 target_words=10000
 actual_words=10000
-active_data_rows=55 active_meta_rows=234 active_edge_rows=285
+active_fabric_rows=4 active_cell_rows=289 active_edge_rows=289
 
 Extracted repeated terms:
 - grounding check: 42

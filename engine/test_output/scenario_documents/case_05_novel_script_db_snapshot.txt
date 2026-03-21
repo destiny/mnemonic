@@ -2,14 +2,14 @@ Scenario Snapshot
 case_id=case_05
 document_type=novel_script
 shared_sqlite_file=general_daily_cases.sqlite
-root_id=019cdd4a-ef97-7320-b0ef-8436af16e8df
-purpose_id=019cdd4a-ef98-7460-a886-137efdb6ca3a
+root_id=019d0e53-b2bc-7c83-9d2a-c77b9430ff1b
+purpose_id=019d0e53-b2bd-7b32-aa59-f2b323f30e21
 section_count=6
 reference_count=20
 tag_count=7
 target_words=100000
 actual_words=100000
-active_data_rows=69 active_meta_rows=255 active_edge_rows=319
+active_fabric_rows=5 active_cell_rows=324 active_edge_rows=324
 
 Extracted repeated terms:
 - Captain Mira: 606

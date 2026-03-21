@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 pub type Timestamp = DateTime<Utc>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cell {
     pub id: Uuid,
     pub cell_type: CellType,
